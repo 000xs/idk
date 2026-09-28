@@ -60,6 +60,9 @@ def b64decode(data: str) -> bytes:
     return base64.urlsafe_b64decode((data + padding).encode())
 
 
+SCRYPT_MAXMEM = 64 * 1024 * 1024  # 64 MiB, explicit (avoids OpenSSL default quirks)
+
+
 def hash_password(password: str) -> str:
     """
     scrypt password hash.
@@ -73,17 +76,33 @@ def hash_password(password: str) -> str:
         r=8,
         p=1,
         dklen=32,
-        maxmem=0,
+        maxmem=SCRYPT_MAXMEM,
     )
     return f"scrypt$16384$8$1${b64encode(salt)}${b64encode(dk)}"
 
 
 def verify_password(password: str, encoded_hash: str) -> bool:
+    """
+    Verify a password against a stored scrypt hash. NEVER raises.
+    Accepts both our format (scrypt$N$r$p$salt$hash) and passlib-style
+    (scrypt:N:r:p$salt$hash). Falls back to a constant-time plaintext
+    compare against ADMIN_PASSWORD if the hash cannot be used.
+    """
     try:
-        algo, n, r, p, salt_b64, hash_b64 = encoded_hash.split("$")
-        if algo != "scrypt":
+        if not password or not encoded_hash:
             return False
 
+        normalized = encoded_hash.strip()
+
+        # passlib format: scrypt:16384:8:1$salt$hash  ->  scrypt$16384$8$1$salt$hash
+        if normalized.startswith("scrypt:"):
+            normalized = "scrypt$" + normalized[len("scrypt:"):].replace(":", "$", 3)
+
+        parts = normalized.split("$")
+        if len(parts) != 6 or parts[0] != "scrypt":
+            raise ValueError("unsupported hash format")
+
+        _, n, r, p, salt_b64, hash_b64 = parts
         salt = b64decode(salt_b64)
         expected = b64decode(hash_b64)
 
@@ -94,11 +113,22 @@ def verify_password(password: str, encoded_hash: str) -> bool:
             r=int(r),
             p=int(p),
             dklen=len(expected),
-            maxmem=0,
+            maxmem=SCRYPT_MAXMEM,
         )
 
         return hmac.compare_digest(dk, expected)
+
     except Exception:
+        # Last-resort fallback: constant-time compare against plaintext env var.
+        # Only possible when ADMIN_PASSWORD is set (never log it!).
+        if ADMIN_PASSWORD:
+            try:
+                return hmac.compare_digest(
+                    (password or "").encode("utf-8"),
+                    ADMIN_PASSWORD.encode("utf-8"),
+                )
+            except Exception:
+                return False
         return False
 
 
@@ -493,7 +523,9 @@ class GlobalExceptionMiddleware(BaseHTTPMiddleware):
             else:
                 details = ""
                 if DEBUG_ERRORS:
+                    summary = html_lib.escape(f"{type(exc).__name__}: {exc}")
                     details = f"""
+    <p style="color:#f87171"><b>{summary}</b></p>
     <div class="details">{html_lib.escape(tb_str)}</div>"""
 
                 html = (
@@ -1277,9 +1309,18 @@ async def login_submit(
 
     purge_failed_attempts()
 
+    # Validate credentials
+    username = (username or "").strip()
+    # NOTE: never strip the password — leading/trailing spaces may be intentional
+    password = password or ""
+    next = (next or "/").strip()
+
+    # Key lockouts by username too — on Hugging Face Spaces request.client.host
+    # is an internal proxy IP (10.16.x.x), so IP-only keys are unreliable.
     ip = request.client.host if request.client else "unknown"
+    attempt_key = f"{ip}|{username}"
     now = time.time()
-    record = failed_attempts.get(ip)
+    record = failed_attempts.get(attempt_key)
 
     if record and record[1] > now:
         return HTMLResponse(
@@ -1288,16 +1329,11 @@ async def login_submit(
         )
 
     if record and record[1] and record[1] <= now:
-        failed_attempts.pop(ip, None)
+        failed_attempts.pop(attempt_key, None)
         record = None
 
-    # Validate credentials
-    username = (username or "").strip()
-    password = (password or "").strip()
-    next = (next or "/").strip()
-
     if username == ADMIN_USERNAME and password and verify_password(password, PASSWORD_HASH):
-        failed_attempts.pop(ip, None)
+        failed_attempts.pop(attempt_key, None)
 
         token = create_session_token(username)
         redirect = RedirectResponse(safe_next_url(next), status_code=302)
@@ -1316,7 +1352,7 @@ async def login_submit(
 
     fail_count = (record[0] + 1) if record else 1
     locked_until = now + LOCK_SECONDS if fail_count >= MAX_FAILED_ATTEMPTS else 0
-    failed_attempts[ip] = (fail_count, locked_until)
+    failed_attempts[attempt_key] = (fail_count, locked_until)
 
     logger.warning(f"⚠️ Failed login attempt from {ip}: {fail_count}")
 
@@ -1336,26 +1372,121 @@ def logout(request: Request):
     return redirect
 
 
+HEALTH_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="15">
+<title>Health - My Cloud</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  background:#0a0a0f;
+  color:#e0e0e0;
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+}
+.card{
+  width:100%;
+  max-width:560px;
+  background:#12121a;
+  border:1px solid #23233a;
+  border-radius:18px;
+  padding:28px;
+  box-shadow:0 20px 60px rgba(0,0,0,0.4);
+}
+h1{
+  font-size:1.5rem;
+  margin-bottom:20px;
+  background:linear-gradient(135deg,#6366f1,#a855f7,#ec4899);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+}
+table{width:100%;border-collapse:collapse}
+td{
+  padding:11px 8px;
+  border-bottom:1px solid #1b1b28;
+  font-size:.92rem;
+  vertical-align:top;
+}
+td.k{color:#8b8b9a;width:45%}
+td.v{color:#e5e7eb;word-break:break-all}
+.ok{color:#34d399;font-weight:600}
+.bad{color:#f87171;font-weight:600}
+.warn{color:#fbbf24;font-weight:600}
+.muted{color:#555;font-size:.78rem;margin-top:16px;text-align:center}
+a{color:#818cf8;text-decoration:none}
+a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>☁️ My Cloud &mdash; Health</h1>
+    <table>%%ROWS%%</table>
+    <div class="muted">Auto-refreshes every 15s &bull; <a href="/">Back to dashboard</a></div>
+  </div>
+</body>
+</html>"""
+
+
+def _health_bool(ok: bool, ok_text: str = "OK", bad_text: str = "FAILING"):
+    cls = "ok" if ok else "bad"
+    mark = "✅" if ok else "❌"
+    return f'<span class="{cls}">{mark} {ok_text if ok else bad_text}</span>'
+
+
 @app.get("/health")
-def health():
-    """Public health endpoint with diagnostic info."""
-    return {
+def health(request: Request):
+    """Public health endpoint. HTML page for browsers, JSON for API clients."""
+    diagnostics = {
         "status": "ok",
         "time": datetime.utcnow().isoformat(),
         "repo": HF_REPO or None,
+        "hf_configured": bool(hf_api),
         "public_base_url": PUBLIC_BASE_URL or None,
         "auth_enabled": AUTH_ENABLED,
         "protect_downloads_effective": bool(PROTECT_DOWNLOADS and AUTH_ENABLED),
         "telegram_ok": TELEGRAM_OK,
-        **(
-            {
-                "telegram_error": TELEGRAM_ERROR,
-                "startup_error": STARTUP_ERROR,
-            }
-            if DEBUG_ERRORS
-            else {}
-        ),
+        "debug_errors": DEBUG_ERRORS,
+        "python": sys.version.split()[0],
     }
+    if DEBUG_ERRORS:
+        diagnostics["telegram_error"] = TELEGRAM_ERROR
+        diagnostics["startup_error"] = STARTUP_ERROR
+
+    accept = request.headers.get("accept", "")
+    wants_json = "application/json" in accept and "text/html" not in accept
+    if wants_json or request.url.query.endswith("format=json"):
+        return JSONResponse(diagnostics)
+
+    rows = [
+        ("Status", '<span class="ok">🟢 Running</span>'),
+        ("Time (UTC)", html_lib.escape(str(diagnostics["time"]))),
+        ("HF Dataset Repo", html_lib.escape(str(diagnostics["repo"]))),
+        ("HF Token configured", _health_bool(diagnostics["hf_configured"], "Yes", "No — set HF_TOKEN")),
+        ("Public base URL", html_lib.escape(str(diagnostics["public_base_url"]))),
+        ("Web auth", _health_bool(diagnostics["auth_enabled"], "Enabled", "Disabled")),
+        ("Protected downloads", _health_bool(
+            diagnostics["protect_downloads_effective"],
+            "Enabled", "Not effective (needs auth + PROTECT_DOWNLOADS)")),
+        ("Telegram bot", _health_bool(diagnostics["telegram_ok"], "Connected", "Not connected")),
+    ]
+    if DEBUG_ERRORS:
+        rows.append(("Telegram error", f'<span class="bad">{html_lib.escape(str(TELEGRAM_ERROR))}</span>'))
+        if STARTUP_ERROR:
+            rows.append(("Startup error", f'<span class="bad">{html_lib.escape(str(STARTUP_ERROR))}</span>'))
+    rows.append(("Debug errors", _health_bool(DEBUG_ERRORS, "On (stack traces shown)", "Off")))
+    rows.append(("Python", html_lib.escape(diagnostics["python"])))
+
+    rows_html = "".join(
+        f"<tr><td class='k'>{k}</td><td class='v'>{v}</td></tr>" for k, v in rows
+    )
+    return HTMLResponse(HEALTH_HTML_TEMPLATE.replace("%%ROWS%%", rows_html))
 
 
 @app.get("/api/me")
