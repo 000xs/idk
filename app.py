@@ -11,8 +11,10 @@ import asyncio
 import logging
 import aiofiles
 import uuid
+import traceback
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
+from datetime import datetime
 
 from fastapi import (
     FastAPI,
@@ -23,6 +25,7 @@ from fastapi import (
     HTTPException,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from huggingface_hub import HfApi
 from telethon import TelegramClient, events
@@ -102,12 +105,12 @@ def verify_password(password: str, encoded_hash: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 # Secrets / Config
 # ══════════════════════════════════════════════════════════════
-HF_TOKEN = os.environ["HF_TOKEN"].strip()
-HF_REPO = os.environ["HF_REPO"].strip()
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_REPO = os.environ.get("HF_REPO", "").strip()
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"].strip()
-BOT_TOKEN = os.environ["TG_BOT_TOKEN"].strip()
+API_ID = int(os.environ.get("TG_API_ID", "0") or "0")
+API_HASH = os.environ.get("TG_API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
@@ -120,6 +123,7 @@ SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "86400"))  # 24 hours
 COOKIE_NAME = os.getenv("COOKIE_NAME", "mc_session")
 
 PROTECT_DOWNLOADS = env_bool("PROTECT_DOWNLOADS", False)
+DEBUG_ERRORS = env_bool("DEBUG_ERRORS", False)
 
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(2 * 1024 * 1024 * 1024)))  # 2 GB
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/mycloud"))
@@ -129,6 +133,11 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FAILED_ATTEMPTS = int(os.getenv("MAX_FAILED_ATTEMPTS", "5"))
 LOCK_SECONDS = int(os.getenv("LOCK_SECONDS", "300"))
 failed_attempts = {}
+
+# Telegram and startup status
+TELEGRAM_OK = False
+TELEGRAM_ERROR = None
+STARTUP_ERROR = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -177,9 +186,9 @@ if PROTECT_DOWNLOADS and not AUTH_ENABLED:
 # ══════════════════════════════════════════════════════════════
 # Clients
 # ══════════════════════════════════════════════════════════════
-hf_api = HfApi(token=HF_TOKEN)
+hf_api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
 app = FastAPI(title="My Cloud")
-client = TelegramClient(MemorySession(), API_ID, API_HASH)
+client = TelegramClient(MemorySession(), API_ID, API_HASH) if API_ID and API_HASH else None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -203,55 +212,82 @@ def create_session_token(username: str) -> str:
 
 
 def parse_session_token(token: str | None) -> dict | None:
-    if not token or token.count(".") != 1:
-        return None
-
-    body, signature = token.split(".", 1)
-
+    """
+    Parse and validate session token. Never throws.
+    Returns None on any invalid token.
+    """
     try:
-        payload = json.loads(b64decode(body))
+        if not token or not isinstance(token, str):
+            return None
+
+        if token.count(".") != 1:
+            return None
+
+        body, signature = token.split(".", 1)
+
+        if not body or not signature:
+            return None
+
+        try:
+            payload = json.loads(b64decode(body))
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        expected_signature = b64encode(
+            hmac.new(SESSION_SECRET, body.encode("utf-8"), hashlib.sha256).digest()
+        )
+
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+
+        try:
+            exp = int(payload.get("exp", 0))
+        except (TypeError, ValueError):
+            return None
+
+        if exp < int(time.time()):
+            return None
+
+        username = payload.get("sub")
+        if not username or not isinstance(username, str) or not username.strip():
+            return None
+
+        return payload
+
     except Exception:
         return None
-
-    expected_signature = b64encode(
-        hmac.new(SESSION_SECRET, body.encode("utf-8"), hashlib.sha256).digest()
-    )
-
-    if not hmac.compare_digest(signature, expected_signature):
-        return None
-
-    try:
-        exp = int(payload.get("exp", 0))
-    except Exception:
-        return None
-
-    if exp < int(time.time()):
-        return None
-
-    username = payload.get("sub")
-    if not username:
-        return None
-
-    return payload
 
 
 def get_current_user(request: Request) -> str | None:
-    token = request.cookies.get(COOKIE_NAME)
-    payload = parse_session_token(token)
-    if not payload:
+    """
+    Get authenticated username from session cookie.
+    Never throws.
+    """
+    try:
+        token = request.cookies.get(COOKIE_NAME)
+        payload = parse_session_token(token)
+        if not payload:
+            return None
+        return payload.get("sub")
+    except Exception:
         return None
-    return payload.get("sub")
 
 
 def is_https_request(request: Request) -> bool:
-    forwarded = request.headers.get("x-forwarded-proto", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip() == "https"
+    try:
+        forwarded = request.headers.get("x-forwarded-proto", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip() == "https"
 
-    if PUBLIC_BASE_URL.startswith("https://"):
-        return True
+        if PUBLIC_BASE_URL.startswith("https://"):
+            return True
 
-    return request.url.scheme == "https"
+        return request.url.scheme == "https"
+    except Exception:
+        return False
 
 
 def safe_next_url(next_url: str | None) -> str:
@@ -321,20 +357,23 @@ def get_base_url(request: Request | None = None) -> str:
     if request is None:
         return ""
 
-    raw_proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    raw_host = (
-        request.headers.get("x-forwarded-host")
-        or request.headers.get("host")
-        or request.url.netloc
-    )
+    try:
+        raw_proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        raw_host = (
+            request.headers.get("x-forwarded-host")
+            or request.headers.get("host")
+            or request.url.netloc
+        )
 
-    proto = raw_proto.split(",")[0].strip() if raw_proto else ""
-    host = raw_host.split(",")[0].strip() if raw_host else ""
+        proto = raw_proto.split(",")[0].strip() if raw_proto else ""
+        host = raw_host.split(",")[0].strip() if raw_host else ""
 
-    if not proto or not host:
+        if not proto or not host:
+            return ""
+
+        return f"{proto}://{host}".rstrip("/")
+    except Exception:
         return ""
-
-    return f"{proto}://{host}".rstrip("/")
 
 
 def build_download_url(filename: str, request: Request | None = None) -> str:
@@ -359,6 +398,114 @@ def build_cdn_url(filename: str, request: Request | None = None) -> str:
         return f"{base}/cdn/{encoded}"
 
     return direct_hf_url(filename, download=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# Global Exception Middleware
+# ══════════════════════════════════════════════════════════════
+ERROR_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  background:#0a0a0f;
+  color:#e0e0e0;
+  padding:20px;
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.error-box{
+  max-width:600px;
+  background:#1a1a24;
+  border:1px solid #2a2a3a;
+  border-radius:16px;
+  padding:30px;
+}
+h1{color:#ef4444;margin-bottom:12px}
+.error-id{color:#888;font-size:.9rem;margin-bottom:20px}
+p{color:#c4b5fd;font-size:.95rem;line-height:1.6;margin-bottom:12px}
+.details{
+  background:#0a0a0f;
+  border:1px solid #1d1d2b;
+  border-radius:8px;
+  padding:12px;
+  font-family:monospace;
+  font-size:.8rem;
+  color:#888;
+  overflow-x:auto;
+  margin-top:16px;
+  white-space:pre-wrap;
+  word-break:break-all;
+}
+a{color:#818cf8;text-decoration:none}
+a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+  <div class="error-box">
+    <h1>❌ Internal Server Error</h1>
+    <div class="error-id">Error ID: %%ERROR_ID%%</div>
+    <p>Something went wrong. Please try again later or contact support.</p>
+    <p><a href="/">← Back to Home</a></p>
+    %%DETAILS%%
+  </div>
+</body>
+</html>"""
+
+
+class GlobalExceptionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            response = await call_next(request)
+            return response
+        except Exception as exc:
+            error_id = secrets.token_hex(8)
+            tb_str = traceback.format_exc()
+            logger.error(f"Unhandled exception [{error_id}]:\n{tb_str}")
+
+            # Determine if client expects JSON
+            accept_header = request.headers.get("accept", "").lower()
+            is_json_request = (
+                "application/json" in accept_header
+                or request.url.path.startswith("/api/")
+            )
+
+            if is_json_request:
+                data = {
+                    "error": "Internal Server Error",
+                    "error_id": error_id,
+                    "status": 500,
+                }
+                if DEBUG_ERRORS:
+                    data["exception"] = type(exc).__name__
+                    data["message"] = str(exc)
+                    data["traceback"] = tb_str
+
+                return JSONResponse(data, status_code=500)
+
+            else:
+                details = ""
+                if DEBUG_ERRORS:
+                    details = f"""
+    <div class="details">{html_lib.escape(tb_str)}</div>"""
+
+                html = (
+                    ERROR_HTML_TEMPLATE
+                    .replace("%%ERROR_ID%%", html_lib.escape(error_id))
+                    .replace("%%DETAILS%%", details)
+                )
+
+                return HTMLResponse(html, status_code=500)
+
+
+app.add_middleware(GlobalExceptionMiddleware)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1120,10 +1267,11 @@ def login_page(request: Request, next: str = "/"):
 @app.post("/login", response_class=HTMLResponse)
 async def login_submit(
     request: Request,
-    username: str = Form(""),
-    password: str = Form(""),
-    next: str = Form("/"),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
+    next: str = Form(default="/"),
 ):
+    """Handle login form submission."""
     if not AUTH_ENABLED:
         return RedirectResponse("/", status_code=302)
 
@@ -1143,7 +1291,12 @@ async def login_submit(
         failed_attempts.pop(ip, None)
         record = None
 
-    if username == ADMIN_USERNAME and verify_password(password, PASSWORD_HASH):
+    # Validate credentials
+    username = (username or "").strip()
+    password = (password or "").strip()
+    next = (next or "/").strip()
+
+    if username == ADMIN_USERNAME and password and verify_password(password, PASSWORD_HASH):
         failed_attempts.pop(ip, None)
 
         token = create_session_token(username)
@@ -1185,12 +1338,23 @@ def logout(request: Request):
 
 @app.get("/health")
 def health():
+    """Public health endpoint with diagnostic info."""
     return {
         "status": "ok",
-        "repo": HF_REPO,
+        "time": datetime.utcnow().isoformat(),
+        "repo": HF_REPO or None,
         "public_base_url": PUBLIC_BASE_URL or None,
         "auth_enabled": AUTH_ENABLED,
         "protect_downloads_effective": bool(PROTECT_DOWNLOADS and AUTH_ENABLED),
+        "telegram_ok": TELEGRAM_OK,
+        **(
+            {
+                "telegram_error": TELEGRAM_ERROR,
+                "startup_error": STARTUP_ERROR,
+            }
+            if DEBUG_ERRORS
+            else {}
+        ),
     }
 
 
@@ -1213,6 +1377,14 @@ def api_me(request: Request):
 @app.get("/api/files")
 def api_files(request: Request):
     ensure_login_api(request)
+
+    if not hf_api:
+        return {
+            "files": [],
+            "items": [],
+            "count": 0,
+            "error": "HF_TOKEN not configured",
+        }
 
     try:
         raw = hf_api.list_repo_files(repo_id=HF_REPO, repo_type="dataset")
@@ -1257,6 +1429,9 @@ def api_files(request: Request):
 @app.post("/api/upload")
 async def api_upload(request: Request, file: UploadFile = File(...)):
     ensure_login_api(request)
+
+    if not hf_api:
+        raise HTTPException(status_code=500, detail="HF_TOKEN not configured")
 
     original_name = file.filename or ""
     filename = Path(original_name).name
@@ -1352,8 +1527,28 @@ def download_file(request: Request, filename: str):
 
 
 # ══════════════════════════════════════════════════════════════
-# Telegram Bot
+# Telegram Bot (Non-fatal startup)
 # ══════════════════════════════════════════════════════════════
+async def start_telegram():
+    """Start Telegram bot in background. Non-fatal if it fails."""
+    global TELEGRAM_OK, TELEGRAM_ERROR
+
+    if not client:
+        logger.warning("⚠️ Telegram client not configured (missing TG_API_ID or TG_API_HASH)")
+        TELEGRAM_ERROR = "Client not configured"
+        return
+
+    try:
+        await client.start(bot_token=BOT_TOKEN)
+        TELEGRAM_OK = True
+        logger.info("✅ Telegram bot connected")
+    except Exception as e:
+        TELEGRAM_OK = False
+        TELEGRAM_ERROR = str(e)
+        logger.error(f"❌ Telegram startup failed: {e}")
+        # Don't re-raise; let FastAPI continue
+
+
 @client.on(events.NewMessage(pattern="/start"))
 async def tg_start(event):
     if PUBLIC_BASE_URL:
@@ -1374,6 +1569,10 @@ async def tg_start(event):
 
 @client.on(events.NewMessage(pattern="/files"))
 async def tg_files(event):
+    if not hf_api:
+        await event.reply("❌ HuggingFace not configured")
+        return
+
     try:
         raw = hf_api.list_repo_files(repo_id=HF_REPO, repo_type="dataset")
 
@@ -1401,6 +1600,9 @@ async def tg_files(event):
 
 @client.on(events.NewMessage())
 async def tg_handle_file(event):
+    if not hf_api:
+        return
+
     if event.message.text and event.message.text.startswith("/"):
         return
 
@@ -1449,7 +1651,6 @@ async def tg_handle_file(event):
                     )
                 )
 
-        # FIXED: download_media() does not support parallel_count in many Telethon versions.
         result = await client.download_media(
             event.message,
             progress_callback=progress,
@@ -1515,6 +1716,8 @@ async def tg_handle_file(event):
 # ══════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def on_startup():
+    global STARTUP_ERROR
+
     logger.info("🚀 Starting My Cloud...")
 
     if PUBLIC_BASE_URL:
@@ -1531,14 +1734,25 @@ async def on_startup():
     else:
         logger.warning("⚠️ Web auth disabled")
 
-    await client.start(bot_token=BOT_TOKEN)
-    logger.info("✅ Telegram bot connected")
+    if DEBUG_ERRORS:
+        logger.info("🐛 DEBUG_ERRORS enabled - will show stack traces in /health")
+
+    # Start Telegram in background (non-fatal)
+    try:
+        asyncio.create_task(start_telegram())
+    except Exception as e:
+        STARTUP_ERROR = str(e)
+        logger.error(f"❌ Failed to create Telegram startup task: {e}")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await client.disconnect()
-    logger.info("🛑 Bot stopped")
+    if client:
+        try:
+            await client.disconnect()
+            logger.info("🛑 Bot disconnected")
+        except Exception as e:
+            logger.warning(f"⚠️ Error disconnecting bot: {e}")
 
 
 if __name__ == "__main__":
