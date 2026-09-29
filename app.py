@@ -1680,12 +1680,15 @@ def download_file(request: Request, filename: str):
 # Chunks are pulled from Telethon on the client event loop and fed
 # directly into huggingface_hub's multipart upload in a worker thread.
 # ══════════════════════════════════════════════════════════════
-class TelegramStreamReader:
+class TelegramStreamReader(io.BufferedIOBase):
     """
     Synchronous file-like object that streams chunks from a Telethon async
     iterator into a blocking reader. huggingface_hub passes this to
     requests-toolbelt's MultipartEncoder, which reads it lazily — so only a
     small buffer lives in RAM and nothing is written to disk.
+
+    Subclasses io.BufferedIOBase because huggingface_hub validates
+    `isinstance(path_or_fileobj, io.BufferedIOBase)` before accepting it.
 
     read() is called from a worker thread; it schedules __anext__() on the
     Telethon client event loop and blocks until the chunk arrives (natural
@@ -1710,6 +1713,8 @@ class TelegramStreamReader:
 
     def read(self, n: int = -1) -> bytes:
         try:
+            if n == 0:
+                return b""
             want = n if (n is not None and n > 0) else self._read_chunk
             while not self._done and len(self._buf) < want:
                 try:
