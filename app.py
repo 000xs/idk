@@ -156,7 +156,25 @@ PROTECT_DOWNLOADS = env_bool("PROTECT_DOWNLOADS", False)
 DEBUG_ERRORS = env_bool("DEBUG_ERRORS", False)
 
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(2 * 1024 * 1024 * 1024)))  # 2 GB
-TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/mycloud"))
+def _pick_tmp_dir() -> str:
+    """Prefer tmpfs (RAM disk, e.g. /dev/shm) so temp files never hit the disk."""
+    for candidate in (os.getenv("TMP_DIR", ""), "/dev/shm/mycloud", "/tmp/mycloud"):
+        if not candidate:
+            continue
+        try:
+            p = Path(candidate)
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".write_probe"
+            probe.write_bytes(b"x")
+            probe.unlink()
+            return candidate
+        except Exception:
+            continue
+    return "/tmp/mycloud"
+
+
+TMP_DIR = Path(_pick_tmp_dir())
+logger.info(f"Temp dir: {TMP_DIR}")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Login brute-force protection
@@ -1658,6 +1676,140 @@ def download_file(request: Request, filename: str):
 
 
 # ══════════════════════════════════════════════════════════════
+# Telegram -> HuggingFace TRUE STREAMING (zero disk usage)
+# Chunks are pulled from Telethon on the client event loop and fed
+# directly into huggingface_hub's multipart upload in a worker thread.
+# ══════════════════════════════════════════════════════════════
+class TelegramStreamReader:
+    """
+    Synchronous file-like object that streams chunks from a Telethon async
+    iterator into a blocking reader. huggingface_hub passes this to
+    requests-toolbelt's MultipartEncoder, which reads it lazily — so only a
+    small buffer lives in RAM and nothing is written to disk.
+
+    read() is called from a worker thread; it schedules __anext__() on the
+    Telethon client event loop and blocks until the chunk arrives (natural
+    backpressure — Telegram only downloads as fast as HF consumes).
+    """
+
+    def __init__(self, aiter, total_size: int, loop, read_chunk: int = 1024 * 1024):
+        self._aiter = aiter
+        self._total = int(total_size)
+        self._loop = loop
+        self._read_chunk = read_chunk
+        self._buf = b""
+        self._done = False
+        self.bytes_served = 0
+
+    # requests-toolbelt uses len(obj) for the Content-Length header
+    def __len__(self):
+        return self._total
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        try:
+            want = n if (n is not None and n > 0) else self._read_chunk
+            while not self._done and len(self._buf) < want:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._aiter.__anext__(), self._loop
+                    )
+                    self._buf += fut.result()
+                except StopAsyncIteration:
+                    self._done = True
+
+            if n is None or n < 0:
+                out, self._buf = self._buf, b""
+            else:
+                out, self._buf = self._buf[:n], self._buf[n:]
+
+            self.bytes_served += len(out)
+            return out
+        except Exception:
+            self._done = True
+            raise
+
+
+async def tg_fallback_disk_upload(event, msg, fname: str) -> None:
+    """Fallback: download to the RAM disk, then upload (old behaviour)."""
+    file_path = None
+
+    try:
+        last_pct = 0
+
+        def progress(cur, tot):
+            nonlocal last_pct
+
+            if not tot:
+                return
+
+            pct = int((cur / tot) * 100)
+
+            if pct >= last_pct + 10:
+                last_pct = pct
+                asyncio.create_task(
+                    msg.edit(
+                        f"📥 *Downloading:* `{fname}`\n⏳ {pct}%",
+                        parse_mode="markdown",
+                    )
+                )
+
+        result = await client.download_media(
+            event.message,
+            progress_callback=progress,
+        )
+
+        if result is None:
+            raise Exception("Download returned None")
+
+        if isinstance(result, bytes):
+            tmp_file = TMP_DIR / f"{uuid.uuid4().hex}_{fname}"
+            tmp_file.write_bytes(result)
+            file_path = str(tmp_file)
+        else:
+            file_path = str(result)
+
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+        await msg.edit(
+            f"📤 *Uploading {size_mb:.1f} MB to Cloud...*",
+            parse_mode="markdown",
+        )
+
+        await asyncio.to_thread(
+            hf_api.upload_file,
+            path_or_fileobj=file_path,
+            path_in_repo=fname,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            commit_message=f"TG upload: {fname}",
+        )
+
+        download_link = build_download_url(fname)
+        cdn_link = build_cdn_url(fname)
+
+        await msg.edit(
+            "✅ *Done!* (fallback mode)\n\n"
+            f"📁 `{fname}`\n"
+            f"📦 {size_mb:.2f} MB\n\n"
+            f"🔗 *Download:*\n{download_link}\n\n"
+            f"🌐 *Inline CDN:*\n{cdn_link}",
+            parse_mode="markdown",
+        )
+
+        logger.info(f"✅ TG upload OK (fallback): {fname}")
+
+    finally:
+        if file_path:
+            try:
+                Path(file_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════
 # Telegram Bot (Non-fatal startup)
 # ══════════════════════════════════════════════════════════════
 async def start_telegram():
@@ -1740,7 +1892,7 @@ async def tg_handle_file(event):
     if not event.message.file:
         return
 
-    msg = await event.reply("📥 *Downloading...*", parse_mode="markdown")
+    msg = await event.reply("📥 *Preparing...*", parse_mode="markdown")
 
     raw_name = getattr(event.message.file, "name", None)
     fname = Path(raw_name).name if raw_name else ""
@@ -1760,64 +1912,60 @@ async def tg_handle_file(event):
     except HTTPException:
         fname = f"tg_{event.message.id}.bin"
 
-    file_path = None
+    total_size = int(getattr(event.message.file, "size", 0) or 0)
 
+    # ── Path 1 (preferred): TRUE streaming — Telegram -> HF, zero disk ──
+    streamed = False
     try:
-        last_pct = 0
+        if total_size <= 0:
+            raise ValueError("unknown file size")
 
-        def progress(cur, tot):
-            nonlocal last_pct
+        loop = asyncio.get_running_loop()
+        aiter = client.iter_download(event.message.media, chunk_size=512 * 1024)
+        stream = TelegramStreamReader(aiter, total_size, loop)
 
-            if not tot:
-                return
+        async def report_progress():
+            try:
+                last = -1
+                while stream.bytes_served < total_size:
+                    await asyncio.sleep(2)
+                    pct = int(stream.bytes_served * 100 / total_size)
+                    if pct != last and pct < 100:
+                        last = pct
+                        await msg.edit(
+                            "🚀 *Streaming to HF...*\n"
+                            f"📁 `{fname}`\n"
+                            f"⏳ {pct}% "
+                            f"({stream.bytes_served / (1024 * 1024):.1f} / "
+                            f"{total_size / (1024 * 1024):.1f} MB)",
+                            parse_mode="markdown",
+                        )
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
-            pct = int((cur / tot) * 100)
+        progress_task = asyncio.create_task(report_progress())
 
-            if pct >= last_pct + 10:
-                last_pct = pct
-                asyncio.create_task(
-                    msg.edit(
-                        f"📥 *Downloading:* `{fname}`\n⏳ {pct}%",
-                        parse_mode="markdown",
-                    )
-                )
+        try:
+            await asyncio.to_thread(
+                hf_api.upload_file,
+                path_or_fileobj=stream,
+                path_in_repo=fname,
+                repo_id=HF_REPO,
+                repo_type="dataset",
+                commit_message=f"TG stream upload: {fname}",
+            )
+        finally:
+            progress_task.cancel()
 
-        result = await client.download_media(
-            event.message,
-            progress_callback=progress,
-        )
-
-        if result is None:
-            raise Exception("Download returned None")
-
-        if isinstance(result, bytes):
-            tmp_file = TMP_DIR / f"{uuid.uuid4().hex}_{fname}"
-            tmp_file.write_bytes(result)
-            file_path = str(tmp_file)
-        else:
-            file_path = str(result)
-
-        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-
-        await msg.edit(
-            f"📤 *Uploading {size_mb:.1f} MB to Cloud...*",
-            parse_mode="markdown",
-        )
-
-        await asyncio.to_thread(
-            hf_api.upload_file,
-            path_or_fileobj=file_path,
-            path_in_repo=fname,
-            repo_id=HF_REPO,
-            repo_type="dataset",
-            commit_message=f"TG upload: {fname}",
-        )
-
+        streamed = True
+        size_mb = total_size / (1024 * 1024)
         download_link = build_download_url(fname)
         cdn_link = build_cdn_url(fname)
 
         await msg.edit(
-            "✅ *Done!*\n\n"
+            "✅ *Done!* (streamed, no disk used)\n\n"
             f"📁 `{fname}`\n"
             f"📦 {size_mb:.2f} MB\n\n"
             f"🔗 *Download:*\n{download_link}\n\n"
@@ -1825,21 +1973,22 @@ async def tg_handle_file(event):
             parse_mode="markdown",
         )
 
-        logger.info(f"✅ TG upload OK: {fname}")
+        logger.info(f"✅ TG stream upload OK: {fname} ({size_mb:.1f} MB)")
 
     except Exception as e:
-        logger.error(f"❌ TG upload failed: {e}")
-        await msg.edit(
-            f"❌ `{type(e).__name__}: {str(e)[:200]}`",
-            parse_mode="markdown",
-        )
+        logger.warning(f"⚠️ Streaming upload failed ({type(e).__name__}: {e}); "
+                       f"falling back to RAM-disk download")
 
-    finally:
-        if file_path:
-            try:
-                Path(file_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+    # ── Path 2 (fallback): RAM-disk download then upload ──
+    if not streamed:
+        try:
+            await tg_fallback_disk_upload(event, msg, fname)
+        except Exception as e:
+            logger.error(f"❌ TG upload failed: {e}")
+            await msg.edit(
+                f"❌ `{type(e).__name__}: {str(e)[:200]}`",
+                parse_mode="markdown",
+            )
 
 
 # ══════════════════════════════════════════════════════════════
