@@ -25,7 +25,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit, urljoin
 
-# Must be set BEFORE huggingface_hub is imported: parallel multipart upload.
+# Must be set BEFORE huggingface_hub is imported.
+# Zero-disk streaming needs the classic LFS path (reads the file object in slices, never all in RAM).
+if os.getenv("STREAM_UPLOAD", "true").strip().lower() in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 try:
     import hf_transfer  # noqa: F401
@@ -62,6 +65,7 @@ SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "86400"))
 COOKIE_NAME = os.getenv("COOKIE_NAME", "mc_session")
 PROTECT_DOWNLOADS = env_bool("PROTECT_DOWNLOADS", False)
 DEBUG_ERRORS = env_bool("DEBUG_ERRORS", False)
+STREAM_UPLOAD = env_bool("STREAM_UPLOAD", True)  # Telegram -> HF with zero disk
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024**3)))
 MAX_FAILED = int(os.getenv("MAX_FAILED_ATTEMPTS", "5"))
 LOCK_SECONDS = int(os.getenv("LOCK_SECONDS", "300"))
@@ -620,6 +624,60 @@ def cdn(request: Request, filename: str):
 def download(request: Request, filename: str):
     return download_guard(request) or RedirectResponse(hf_url(filename, True), 302)
 
+class RemoteStream(io.BufferedIOBase):
+    """Seekable file-like object with NO disk usage.
+
+    huggingface_hub must know the sha256 before uploading to LFS, so it reads the
+    file once (hash), seeks back to 0, and reads it again (upload). Instead of a
+    local file we re-open the remote source (Telegram) at the requested offset,
+    so RAM use stays at a few MB and nothing is written to disk.
+    """
+    ALIGN = 1024 * 1024
+
+    def __init__(self, opener, size: int, loop):
+        self._open, self._size, self._loop = opener, int(size), loop
+        self._pos, self._it, self._skip = 0, None, 0
+        self._buf = bytearray()
+        self.bytes_served = 0
+
+    def __len__(self): return self._size
+    def readable(self): return True
+    def seekable(self): return True
+    def tell(self): return self._pos
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_CUR:
+            offset += self._pos
+        elif whence == io.SEEK_END:
+            offset += self._size
+        offset = max(0, min(int(offset), self._size))
+        if offset != self._pos:
+            self._it, self._buf, self._pos = None, bytearray(), offset
+        return self._pos
+
+    def read(self, n=-1):
+        left = self._size - self._pos
+        n = left if (n is None or n < 0) else min(n, left)
+        if n <= 0:
+            return b""
+        if self._it is None:
+            start = self._pos - self._pos % self.ALIGN
+            self._it, self._skip, self._buf = self._open(start), self._pos - start, bytearray()
+        while len(self._buf) < n:
+            try:
+                chunk = asyncio.run_coroutine_threadsafe(self._it.__anext__(), self._loop).result()
+            except StopAsyncIteration:
+                break
+            if self._skip:
+                cut = min(self._skip, len(chunk))
+                chunk, self._skip = chunk[cut:], self._skip - cut
+            self._buf += chunk
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        self._pos += len(out)
+        self.bytes_served += len(out)
+        return out
+
 # ───────────────────────── Telegram ─────────────────────────
 def register_telegram():
     @client.on(events.NewMessage(pattern="/start"))
@@ -664,6 +722,36 @@ def register_telegram():
                 last["t"] = now
                 asyncio.get_running_loop().create_task(
                     edit(f"Downloading {fname}\n{cur * 100 // tot}% · {cur / 1048576 / max(now - t0, .1):.1f} MB/s"))
+
+        if STREAM_UPLOAD and total > 0:
+            stream = RemoteStream(
+                lambda off: client.iter_download(m.media, offset=off, request_size=1024 * 1024, file_size=total),
+                total, asyncio.get_running_loop())
+
+            async def report():
+                try:
+                    while True:
+                        await asyncio.sleep(3)
+                        pct = min(99, stream.bytes_served * 100 // (2 * total))
+                        await edit(f"Streaming {fname} to storage\n{pct}% (no disk used)")
+                except asyncio.CancelledError:
+                    pass
+
+            rep = asyncio.create_task(report())
+            try:
+                await asyncio.to_thread(hf_api.upload_file, path_or_fileobj=stream, path_in_repo=fname,
+                                        repo_id=HF_REPO, repo_type="dataset",
+                                        commit_message=f"Telegram stream upload: {fname}")
+                _cache["t"] = 0
+                l = links(fname)
+                await edit(f"Done: {fname} ({total / 1048576:.1f} MB)\n\nDownload:\n{l['download_url']}\n\nStream:\n{l['cdn_url']}")
+                log.info("TG STREAM upload OK %s: %.1f MB in %.1fs, served %.1f MB",
+                         fname, total / 1048576, time.time() - t0, stream.bytes_served / 1048576)
+                return
+            except Exception as e:
+                log.warning("Stream upload failed (%s: %s) -> falling back to temp-file mode", type(e).__name__, e)
+            finally:
+                rep.cancel()
 
         try:
             await client.download_media(m, file=str(tmp), progress_callback=progress)
