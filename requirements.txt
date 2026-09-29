@@ -1,6 +1,9 @@
 fastapi
 uvicorn[standard]
-python-multipart
-huggingface_hub
-telethon
 aiofiles
+httpx
+telethon
+cryptg
+huggingface_hub
+hf_transfer
+python-multipart
