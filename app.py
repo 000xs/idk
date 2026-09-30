@@ -398,6 +398,67 @@ async def run_mux(job: dict, v: dict, sub: dict, out_name: str, lang: str, track
         if work:
             shutil.rmtree(work, ignore_errors=True)
 
+def mp4_name(name: str) -> str:
+    name = Path(name.replace("\\", "/")).name.strip() or "output"
+    if name.lower().endswith(".mp4"):
+        return name
+    if Path(name).suffix.lower() in (VIDEO_EXT | {".avi"}):
+        return str(Path(name).with_suffix(".mp4"))
+    return name + ".mp4"
+
+async def run_burn(job: dict, v: dict, sub: dict, out_name: str, font: str, size: int, crf: int, preset: str):
+    """Hardcode (burn-in) subtitles with ffmpeg. Re-encodes the video, so it is CPU heavy."""
+    work = None
+    try:
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            raise ValueError("ffmpeg is not installed on the server (add ffmpeg to the Dockerfile)")
+        job.update(stage="working", label="Waiting for another job to finish", pct=None)
+        async with MUX_SEM:
+            hint = next((f["size"] for f in _cache["items"] if v["type"] == "storage" and f["name"] == v["value"]), 0)
+            work = pick_tmp((hint or 2 * 1024**3) * 2) / f"burn_{job['id']}"
+            work.mkdir(parents=True, exist_ok=True)
+            vpath, vname = await fetch_source(job, v, work / "video", "video", ".mkv")
+            spath, _ = await fetch_source(job, sub, work / "sub", "subtitle", ".srt")
+            out_name = job["name"] = mp4_name(out_name or f"{Path(vname).stem}_hardsub.mp4")
+            if v["type"] == "storage" and out_name == vname:
+                raise ValueError("Choose a different output name so the original video isn't overwritten")
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(vpath),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                duration = float((await probe.communicate())[0].decode().strip() or 0)
+            except ValueError:
+                duration = 0.0
+            vf = f"subtitles={spath.name}:force_style='FontName={font},FontSize={size},Outline=2,Shadow=0'"
+            cmd = ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
+                   "-i", str(vpath), "-map", "0:v:0", "-map", "0:a?", "-sn", "-vf", vf,
+                   "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "out.mp4"]
+            job.update(label="Encoding video", pct=0 if duration else None)
+            proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(work), stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.STDOUT)
+            tail = b""
+            while chunk := await proc.stdout.read(4096):
+                tail = (tail + chunk)[-3000:]
+                m = re.findall(rb"out_time_(?:us|ms)=(\d+)", tail)
+                if m and duration:
+                    job.update(label="Encoding video", pct=min(99, int(int(m[-1]) / 1e6 * 100 / duration)))
+            rc = await proc.wait()
+            out = work / "out.mp4"
+            if rc != 0 or not out.exists():
+                msg = re.sub(rb"[a-z_0-9]+=\S*\s*", b"", tail).decode("utf-8", "replace").strip()[-300:]
+                raise ValueError("ffmpeg failed: " + msg)
+            job.update(label="Saving to storage…", pct=None)
+            await push_to_hf(out, out_name, "Hardsub")
+        job.update(stage="done", label=None, **links(out_name))
+        log.info("Hardsub OK: %s", out_name)
+    except Exception as e:
+        log.error("Hardsub failed: %s", e)
+        job.update(stage="error", error=str(e) or type(e).__name__)
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+
 # ───────────────────────── App ─────────────────────────
 client = TelegramClient(MemorySession(), API_ID, API_HASH) if API_ID and API_HASH else None
 tg_state = {"ok": False, "error": None}
@@ -512,7 +573,10 @@ dialog video{display:block;width:100%;max-height:80vh}dialog form{position:absol
 .pk-list div:hover{background:color-mix(in srgb,var(--acc) 10%,transparent)}
 .pk-list small{color:var(--mute);white-space:nowrap}.pk-list .none{color:var(--mute);cursor:default}
 .grid3{display:grid;grid-template-columns:2fr 1fr 2fr;gap:10px}
-.grid3 label{font-size:.8rem;color:var(--mute);display:block;margin-bottom:4px}
+.tabs{overflow-x:auto}.tab{white-space:nowrap;padding:14px 16px;flex:1 0 auto}
+select{width:100%;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.gridE{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.gridE label,.grid3 label{font-size:.8rem;color:var(--mute);display:block;margin-bottom:4px}
 @media(max-width:700px){.grid3{grid-template-columns:1fr}}
 </style></head><body>
 <header><div class="logo">My Cloud</div><div><span id="who" style="color:var(--mute);margin-right:10px"></span><form id="lo" method="post" action="/logout" style="display:inline"><button class="btn ghost sm">Sign out</button></form></div></header>
@@ -524,6 +588,7 @@ dialog video{display:block;width:100%;max-height:80vh}dialog form{position:absol
   <button class="tab" role="tab" id="t1" aria-selected="true" aria-controls="p1">From this device</button>
   <button class="tab" role="tab" id="t2" aria-selected="false" aria-controls="p2">From a link</button>
   <button class="tab" role="tab" id="t3" aria-selected="false" aria-controls="p3">Add subtitles</button>
+  <button class="tab" role="tab" id="t4" aria-selected="false" aria-controls="p4">Hardcode subtitles</button>
  </div>
  <div class="pane" id="p1" role="tabpanel">
   <input type="text" id="dname" placeholder="Save as (optional, single file only)" aria-label="File name" style="margin-bottom:12px">
@@ -549,6 +614,24 @@ dialog video{display:block;width:100%;max-height:80vh}dialog form{position:absol
    <div class="grid3"><div><label for="oname">Save as</label><input type="text" id="oname" placeholder="movie_sub.mkv"></div><div><label for="lang">Language code</label><input type="text" id="lang" value="si"></div><div><label for="tname">Track name</label><input type="text" id="tname" value="සිංහල | Sinhala"></div></div>
    <div><button class="btn" id="mux">Merge subtitles &amp; save</button></div>
    <p class="hint" style="margin:0">Adds the subtitle as a selectable track (soft-sub). The video is not re-encoded, so it stays fast. Output is .mkv. Needs free disk for the video twice.</p>
+  </div></div>
+ <div class="pane" id="p4" role="tabpanel" hidden><div class="steps">
+   <fieldset class="src" id="hsrcV"><legend>Video</legend>
+    <div class="seg"><button type="button" data-m="storage" aria-pressed="true">From storage</button><button type="button" data-m="url" aria-pressed="false">From link</button></div>
+    <div class="pk"><input type="text" class="pk-in" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Search your videos" aria-label="Search your videos"><div class="pk-list" role="listbox" hidden></div></div>
+    <input type="text" class="u-in" placeholder="https://…/movie.mkv" aria-label="Video link" hidden>
+   </fieldset>
+   <fieldset class="src" id="hsrcS"><legend>Subtitle (.srt, .ass, .ssa, .vtt)</legend>
+    <div class="seg"><button type="button" data-m="storage" aria-pressed="true">From storage</button><button type="button" data-m="url" aria-pressed="false">From link</button></div>
+    <div class="pk"><input type="text" class="pk-in" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Search your subtitle files" aria-label="Search your subtitle files"><div class="pk-list" role="listbox" hidden></div></div>
+    <input type="text" class="u-in" placeholder="https://…/movie.srt" aria-label="Subtitle (.srt, .ass, .ssa, .vtt) link" hidden>
+   </fieldset>
+   <div class="gridE"><div><label for="hname">Save as</label><input type="text" id="hname" placeholder="movie_hardsub.mp4"></div><div><label for="hfont">Font</label><input type="text" id="hfont" value="Noto Sans Sinhala"></div></div>
+   <div class="gridE"><div><label for="hsize">Font size</label><input type="text" id="hsize" value="22" inputmode="numeric"></div>
+    <div><label for="hcrf">Quality</label><select id="hcrf"><option value="18">High (larger file)</option><option value="21" selected>Balanced</option><option value="25">Smaller file</option></select></div>
+    <div><label for="hpre">Speed</label><select id="hpre"><option value="ultrafast">Fastest (bigger file)</option><option value="veryfast" selected>Fast</option><option value="medium">Slow (smaller file)</option></select></div></div>
+   <div><button class="btn" id="burn">Burn subtitles &amp; save</button></div>
+   <p class="hint" style="margin:0">Draws the subtitle into the picture, so it shows in every player. This re-encodes the video (H.264 + AAC, output .mp4) and can take a long time on a shared CPU.</p>
   </div></div>
  <div class="xfers" id="xfers" style="padding:0 22px 22px;margin:0"></div>
 </div>
@@ -619,6 +702,13 @@ $('mux').onclick=async()=>{const v=vs.get(),s=ss.get();if(!v)return toast('Choos
  try{const r=await api('/api/subtitle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({video:v,sub:s,name:name,lang:$('lang').value.trim()||'si',track:$('tname').value.trim()})});const j=await r.json();
   if(!r.ok)x.end('error',j.detail||'Rejected');else poll(j.id,x)}catch(e){x.end('error','Request failed')}
  $('mux').disabled=false};
+const hv=mkSrc($('hsrcV'),VIDX,n=>{const o=$('hname');if(!o._m){const i=n.lastIndexOf('.');o.value=(i>0?n.slice(0,i):n)+'_hardsub.mp4'}}),hs=mkSrc($('hsrcS'),SUBX);
+$('hname').addEventListener('input',e=>{e.target._m=!!e.target.value});
+$('burn').onclick=async()=>{const v=hv.get(),s=hs.get();if(!v)return toast('Choose a video');if(!s)return toast('Choose a subtitle file');
+ const name=$('hname').value.trim();$('burn').disabled=true;const x=xfer(name||v.value.split('/').pop());
+ try{const r=await api('/api/hardsub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({video:v,sub:s,name:name,font:$('hfont').value.trim(),size:$('hsize').value.trim(),crf:$('hcrf').value,preset:$('hpre').value})});const j=await r.json();
+  if(!r.ok)x.end('error',j.detail||'Rejected');else poll(j.id,x)}catch(e){x.end('error','Request failed')}
+ $('burn').disabled=false};
 (async()=>{try{const m=await(await fetch('/api/me')).json();if(m.auth_enabled&&!m.authenticated)return location.href='/login?next=%2F';$('who').textContent=m.auth_enabled?m.username:'';if(!m.auth_enabled)$('lo').remove()}catch(e){}load()})();
 </script></body></html>"""
 
@@ -672,7 +762,7 @@ def logout():
 def health():
     return {"status": "ok", "time": time.time(), "hf_configured": bool(hf_api), "repo": HF_REPO or None,
             "auth_enabled": AUTH_ENABLED, "telegram_ok": tg_state["ok"],
-            "mkvmerge": bool(shutil.which("mkvmerge")), "fast_upload": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1",
+            "mkvmerge": bool(shutil.which("mkvmerge")), "ffmpeg": bool(shutil.which("ffmpeg")), "fast_upload": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1",
             **({"telegram_error": tg_state["error"]} if DEBUG_ERRORS else {})}
 
 @app.get("/api/me")
@@ -759,12 +849,7 @@ async def api_remote(request: Request):
     asyncio.create_task(run_remote(job, url, name))
     return {"id": job["id"]}
 
-@app.post("/api/subtitle")
-async def api_subtitle(request: Request):
-    require_login(request)
-    if not hf_api:
-        raise HTTPException(500, "HF_TOKEN is not configured")
-    b = await request.json()
+async def parse_sources(b: dict) -> list:
     srcs = []
     for key in ("video", "sub"):
         src = b.get(key) or {}
@@ -779,6 +864,15 @@ async def api_subtitle(request: Request):
         else:
             safe_name(val)
         srcs.append({"type": kind, "value": val})
+    return srcs
+
+@app.post("/api/subtitle")
+async def api_subtitle(request: Request):
+    require_login(request)
+    if not hf_api:
+        raise HTTPException(500, "HF_TOKEN is not configured")
+    b = await request.json()
+    srcs = await parse_sources(b)
     lang = str(b.get("lang") or "si").strip()
     if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", lang):
         raise HTTPException(400, "Language must be an ISO code such as si or en")
@@ -786,6 +880,27 @@ async def api_subtitle(request: Request):
     name = str(b.get("name") or "").strip()
     job = new_job(name or "subtitle merge")
     asyncio.create_task(run_mux(job, srcs[0], srcs[1], name, lang, track))
+    return {"id": job["id"]}
+
+@app.post("/api/hardsub")
+async def api_hardsub(request: Request):
+    require_login(request)
+    if not hf_api:
+        raise HTTPException(500, "HF_TOKEN is not configured")
+    b = await request.json()
+    srcs = await parse_sources(b)
+    font = str(b.get("font") or "Noto Sans Sinhala").strip()
+    if not re.fullmatch(r"[A-Za-z0-9 _-]{1,60}", font):
+        raise HTTPException(400, "Font name may only contain letters, numbers, spaces, - and _")
+    try:
+        size = max(8, min(72, int(b.get("size") or 22)))
+        crf = max(16, min(30, int(b.get("crf") or 21)))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Font size and quality must be numbers")
+    preset = b.get("preset") if b.get("preset") in {"ultrafast", "veryfast", "faster", "medium"} else "veryfast"
+    name = str(b.get("name") or "").strip()
+    job = new_job(name or "hardcode subtitles")
+    asyncio.create_task(run_burn(job, srcs[0], srcs[1], name, font, size, crf, preset))
     return {"id": job["id"]}
 
 @app.get("/api/jobs/{job_id}")
