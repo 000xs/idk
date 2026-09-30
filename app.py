@@ -276,6 +276,8 @@ async def run_remote(job: dict, url: str, name: str):
                 if total > MAX_FILE_SIZE:
                     raise ValueError("File is larger than the size limit")
                 fname = safe_name(name) if name else guess_name(resp, cur)
+                if name and not Path(fname).suffix:
+                    fname += Path(guess_name(resp, cur)).suffix
                 job.update(name=fname, total=total, stage="downloading")
                 tmp = pick_tmp(total) / f"{uuid.uuid4().hex}_{fname}"
                 t0 = time.time()
@@ -298,6 +300,103 @@ async def run_remote(job: dict, url: str, name: str):
     finally:
         if tmp:
             Path(tmp).unlink(missing_ok=True)
+
+# ───────────────────────── Subtitle soft-mux (mkvmerge) ─────────────────────────
+MUX_SEM = asyncio.Semaphore(1)  # one merge at a time (disk + CPU)
+
+def _ext(name: str, default: str) -> str:
+    e = Path(name).suffix.lower()
+    return e if re.fullmatch(r"\.[a-z0-9]{1,5}", e) else default
+
+def mkv_name(name: str) -> str:
+    name = Path(name.replace("\\", "/")).name.strip() or "output"
+    if name.lower().endswith(".mkv"):
+        return name
+    if Path(name).suffix.lower() in (VIDEO_EXT | {".avi"}):
+        return str(Path(name).with_suffix(".mkv"))
+    return name + ".mkv"
+
+async def fetch_source(job: dict, src: dict, dest_stem: Path, label: str, default_ext: str):
+    """Download a storage file or a public URL to disk. Returns (path, original_name)."""
+    if src["type"] == "storage":
+        name = safe_name(src["value"])
+        url, public = hf_url(name), False
+        auth = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else None
+    else:
+        url, public, name, auth = src["value"], True, "", None
+    async with httpx.AsyncClient(follow_redirects=False, headers={"User-Agent": "Mozilla/5.0 (MyCloud)"},
+                                 timeout=httpx.Timeout(30, read=120)) as http:
+        cur = url
+        for hop in range(6):
+            if public:
+                await assert_public(cur)
+            resp = await http.send(http.build_request("GET", cur, headers=auth if hop == 0 else None), stream=True)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                cur = urljoin(cur, resp.headers.get("location", ""))
+                await resp.aclose()
+                continue
+            break
+        else:
+            raise ValueError("Too many redirects")
+        try:
+            if resp.status_code >= 400:
+                raise ValueError(f"The {label} source answered HTTP {resp.status_code}")
+            name = name or guess_name(resp, cur)
+            dest = dest_stem.with_suffix(_ext(name, default_ext))
+            total, done = int(resp.headers.get("content-length") or 0), 0
+            async with aiofiles.open(dest, "wb") as out:
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    done += len(chunk)
+                    if done > MAX_FILE_SIZE:
+                        raise ValueError("File is larger than the size limit")
+                    await out.write(chunk)
+                    job.update(label=f"Downloading {label} · {done / 1048576:.0f} MB", pct=(done * 100 // total if total else None))
+            return dest, name
+        finally:
+            await resp.aclose()
+
+async def run_mux(job: dict, v: dict, sub: dict, out_name: str, lang: str, track: str):
+    work = None
+    try:
+        if not shutil.which("mkvmerge"):
+            raise ValueError("mkvmerge is not installed on the server (install the mkvtoolnix package)")
+        job.update(stage="working", label="Waiting for another merge to finish", pct=None)
+        async with MUX_SEM:
+            size = next((f["size"] for f in _cache["items"] if v["type"] == "storage" and f["name"] == v["value"]), 0)
+            work = pick_tmp((size or 2 * 1024**3) * 2) / f"mux_{job['id']}"
+            work.mkdir(parents=True, exist_ok=True)
+            vpath, vname = await fetch_source(job, v, work / "video", "video", ".mkv")
+            spath, _ = await fetch_source(job, sub, work / "sub", "subtitle", ".srt")
+            out_name = job["name"] = mkv_name(out_name or f"{Path(vname).stem}_sub.mkv")
+            if v["type"] == "storage" and out_name == vname:
+                raise ValueError("Choose a different output name so the original video isn't overwritten")
+            out = work / "out.mkv"
+            cmd = ["mkvmerge", "-o", str(out), str(vpath), "--language", f"0:{lang}", "--track-name", f"0:{track}"]
+            if spath.suffix in {".srt", ".ass", ".ssa"}:
+                cmd += ["--sub-charset", "0:UTF-8"]
+            cmd.append(str(spath))
+            job.update(label="Merging subtitles", pct=0)
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            tail = b""
+            while chunk := await proc.stdout.read(4096):
+                tail = (tail + chunk)[-3000:]
+                m = re.findall(rb"Progress: (\d+)%", tail)
+                if m:
+                    job["pct"] = int(m[-1])
+            rc = await proc.wait()
+            if rc >= 2 or not out.exists():
+                msg = re.sub(r"Progress: \d+%\s*", "", tail.decode("utf-8", "replace")).strip()[-300:]
+                raise ValueError("mkvmerge failed: " + msg)
+            job.update(label="Saving to storage…", pct=None)
+            await push_to_hf(out, out_name, "Subtitle mux")
+        job.update(stage="done", label=None, **links(out_name))
+        log.info("Subtitle mux OK: %s", out_name)
+    except Exception as e:
+        log.error("Subtitle mux failed: %s", e)
+        job.update(stage="error", error=str(e) or type(e).__name__)
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
 
 # ───────────────────────── App ─────────────────────────
 client = TelegramClient(MemorySession(), API_ID, API_HASH) if API_ID and API_HASH else None
@@ -372,7 +471,7 @@ header{display:flex;justify-content:space-between;align-items:center;padding:18p
 main{max-width:920px;margin:0 auto;padding:8px clamp(16px,4vw,40px) 80px}
 h1{font-size:clamp(2rem,5vw,3rem);font-weight:800;letter-spacing:-.035em;line-height:1.05;margin:18px 0 6px}
 .lead{color:var(--mute);margin-bottom:26px;max-width:52ch}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px}
 .tabs{display:flex;border-bottom:1px solid var(--line)}
 .tab{flex:1;padding:14px;background:none;border:0;cursor:pointer;color:var(--mute);font-weight:600;border-bottom:2px solid transparent;margin-bottom:-1px}
 .tab[aria-selected=true]{color:var(--ink);border-bottom-color:var(--acc)}
@@ -401,6 +500,20 @@ dialog{border:0;border-radius:14px;padding:0;background:#000;max-width:min(92vw,
 dialog video{display:block;width:100%;max-height:80vh}dialog form{position:absolute;top:8px;right:8px}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:8px;font-size:.9rem;opacity:0;pointer-events:none;transition:opacity .2s}
 #toast.on{opacity:1}
+.steps{display:grid;gap:14px}
+.src{border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}
+.src legend{padding:0 6px;font-weight:700;font-size:.9rem}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:10px}
+.seg button{background:none;border:0;padding:6px 12px;cursor:pointer;color:var(--mute);font-size:.85rem}
+.seg button[aria-pressed=true]{background:var(--acc);color:var(--acc-ink)}
+.pk{position:relative}
+.pk-list{position:absolute;left:0;right:0;top:calc(100% + 4px);max-height:240px;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:10px;z-index:5;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.pk-list div{padding:8px 12px;cursor:pointer;word-break:break-all;display:flex;justify-content:space-between;gap:10px;font-size:.9rem}
+.pk-list div:hover{background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.pk-list small{color:var(--mute);white-space:nowrap}.pk-list .none{color:var(--mute);cursor:default}
+.grid3{display:grid;grid-template-columns:2fr 1fr 2fr;gap:10px}
+.grid3 label{font-size:.8rem;color:var(--mute);display:block;margin-bottom:4px}
+@media(max-width:700px){.grid3{grid-template-columns:1fr}}
 </style></head><body>
 <header><div class="logo">My Cloud</div><div><span id="who" style="color:var(--mute);margin-right:10px"></span><form id="lo" method="post" action="/logout" style="display:inline"><button class="btn ghost sm">Sign out</button></form></div></header>
 <main>
@@ -410,8 +523,10 @@ dialog video{display:block;width:100%;max-height:80vh}dialog form{position:absol
  <div class="tabs" role="tablist">
   <button class="tab" role="tab" id="t1" aria-selected="true" aria-controls="p1">From this device</button>
   <button class="tab" role="tab" id="t2" aria-selected="false" aria-controls="p2">From a link</button>
+  <button class="tab" role="tab" id="t3" aria-selected="false" aria-controls="p3">Add subtitles</button>
  </div>
  <div class="pane" id="p1" role="tabpanel">
+  <input type="text" id="dname" placeholder="Save as (optional, single file only)" aria-label="File name" style="margin-bottom:12px">
   <label class="drop" id="drop" for="pick"><b>Drop files here or choose them</b><span>Up to 20&nbsp;GB each. Videos work best as MP4.</span></label>
   <input type="file" id="pick" multiple hidden>
  </div>
@@ -420,6 +535,21 @@ dialog video{display:block;width:100%;max-height:80vh}dialog form{position:absol
   <div class="row"><input type="text" id="rname" placeholder="Save as (optional, single link only)" aria-label="File name"><button class="btn" id="fetch">Fetch to cloud</button></div>
   <p class="hint">The server downloads the file directly, so nothing passes through your device.</p>
  </div>
+ <div class="pane" id="p3" role="tabpanel" hidden><div class="steps">
+   <fieldset class="src" id="srcV"><legend>Video</legend>
+    <div class="seg"><button type="button" data-m="storage" aria-pressed="true">From storage</button><button type="button" data-m="url" aria-pressed="false">From link</button></div>
+    <div class="pk"><input type="text" class="pk-in" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Search your videos" aria-label="Search your videos"><div class="pk-list" role="listbox" hidden></div></div>
+    <input type="text" class="u-in" placeholder="https://…/movie.mkv" aria-label="Video link" hidden>
+   </fieldset>
+   <fieldset class="src" id="srcS"><legend>Subtitle (.srt, .ass, .ssa, .vtt)</legend>
+    <div class="seg"><button type="button" data-m="storage" aria-pressed="true">From storage</button><button type="button" data-m="url" aria-pressed="false">From link</button></div>
+    <div class="pk"><input type="text" class="pk-in" role="combobox" aria-expanded="false" autocomplete="off" placeholder="Search your subtitle files" aria-label="Search your subtitle files"><div class="pk-list" role="listbox" hidden></div></div>
+    <input type="text" class="u-in" placeholder="https://…/movie.srt" aria-label="Subtitle (.srt, .ass, .ssa, .vtt) link" hidden>
+   </fieldset>
+   <div class="grid3"><div><label for="oname">Save as</label><input type="text" id="oname" placeholder="movie_sub.mkv"></div><div><label for="lang">Language code</label><input type="text" id="lang" value="si"></div><div><label for="tname">Track name</label><input type="text" id="tname" value="සිංහල | Sinhala"></div></div>
+   <div><button class="btn" id="mux">Merge subtitles &amp; save</button></div>
+   <p class="hint" style="margin:0">Adds the subtitle as a selectable track (soft-sub). The video is not re-encoded, so it stays fast. Output is .mkv. Needs free disk for the video twice.</p>
+  </div></div>
  <div class="xfers" id="xfers" style="padding:0 22px 22px;margin:0"></div>
 </div>
 <section class="files"><div class="fh"><h2>Your files <span id="cnt" style="color:var(--mute);font-weight:500"></span></h2><input type="text" id="q" placeholder="Search files" aria-label="Search files"></div>
@@ -438,14 +568,15 @@ function copy(t){navigator.clipboard.writeText(t).then(()=>toast('Link copied'),
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>{x.setAttribute('aria-selected',x===t);$(x.getAttribute('aria-controls')).hidden=x!==t})});
 function xfer(name){const d=document.createElement('div');d.className='x';d.innerHTML='<div class="top"><span class="n"></span><span class="st">Starting</span></div><div class="bar"><i></i></div>';d.querySelector('.n').textContent=name;$('xfers').prepend(d);
  return{set(st,p,ind){d.querySelector('.st').textContent=st;const b=d.querySelector('.bar');b.classList.toggle('ind',!!ind);if(p!=null)b.firstChild.style.width=p+'%'},end(cls,st){d.className='x '+cls;d.querySelector('.st').textContent=st;d.querySelector('.bar').style.display='none';setTimeout(()=>d.remove(),cls==='done'?6000:20000)}}}
-function upload(file){const x=xfer(file.name),t0=Date.now();const r=new XMLHttpRequest();
- r.open('POST','/api/upload?name='+encodeURIComponent(file.name));
+function upload(file,name){name=name||file.name;const x=xfer(name),t0=Date.now();const r=new XMLHttpRequest();
+ r.open('POST','/api/upload?name='+encodeURIComponent(name));
  r.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=e.loaded/e.total*100,s=e.loaded/((Date.now()-t0)/1000||1);x.set(p<100?Math.round(p)+'% · '+fmt(s)+'/s':'Saving to storage…',p,p>=100)};
  r.onload=()=>{if(r.status===200){x.end('done','Done');toast('Uploaded '+file.name);load()}else if(r.status===401)location.href='/login';else{let m='Upload failed';try{m=JSON.parse(r.responseText).detail||m}catch(e){}x.end('error',m)}};
  r.onerror=()=>x.end('error','Network error');r.send(file)}
 const drop=$('drop');['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
-drop.addEventListener('drop',e=>[...e.dataTransfer.files].forEach(upload));$('pick').onchange=e=>{[...e.target.files].forEach(upload);e.target.value=''};
+function many(fs){fs=[...fs];let n=$('dname').value.trim();fs.forEach(f=>{let nm='';if(fs.length===1&&n){const i=f.name.lastIndexOf('.');nm=n.includes('.')||i<0?n:n+f.name.slice(i)}upload(f,nm)});$('dname').value=''}
+drop.addEventListener('drop',e=>many(e.dataTransfer.files));$('pick').onchange=e=>{many(e.target.files);e.target.value=''};
 $('fetch').onclick=async()=>{const urls=$('urls').value.split(/\\s+/).filter(Boolean);if(!urls.length)return toast('Paste at least one link');
  const name=urls.length===1?$('rname').value.trim():'';$('fetch').disabled=true;
  for(const url of urls){const x=xfer(url.split('/').pop()||url);
@@ -453,7 +584,8 @@ $('fetch').onclick=async()=>{const urls=$('urls').value.split(/\\s+/).filter(Boo
    if(!r.ok){x.end('error',j.detail||'Rejected');continue}poll(j.id,x)}catch(e){x.end('error','Request failed')}}
  $('urls').value='';$('rname').value='';$('fetch').disabled=false};
 async function poll(id,x){const r=await api('/api/jobs/'+id);const j=await r.json();
- if(j.stage==='downloading')x.set('Downloading '+(j.total?Math.round(j.done/j.total*100)+'% · ':'')+fmt(j.speed)+'/s',j.total?j.done/j.total*100:null,!j.total);
+ if(j.label&&j.stage!=='done'&&j.stage!=='error')x.set(j.label,j.pct,j.pct==null);
+ else if(j.stage==='downloading')x.set('Downloading '+(j.total?Math.round(j.done/j.total*100)+'% · ':'')+fmt(j.speed)+'/s',j.total?j.done/j.total*100:null,!j.total);
  else if(j.stage==='uploading')x.set('Saving to storage…',100,true);
  else if(j.stage==='done'){x.end('done','Done');toast('Saved '+j.name);load();return}
  else if(j.stage==='error'){x.end('error',j.error||'Failed');return}
@@ -468,6 +600,25 @@ $('list').onclick=async e=>{const b=e.target.closest('button');if(!b)return;cons
  else if(a==='del'&&confirm('Delete '+f.name+'? This cannot be undone.')){const r=await api('/api/files/'+encodeURIComponent(f.name),{method:'DELETE'});if(r.ok){toast('Deleted');load()}else toast('Delete failed')}};
 $('dlg').addEventListener('close',()=>{$('vid').pause();$('vid').removeAttribute('src');$('vid').load()});$('q').oninput=render;
 async function load(){try{const r=await api('/api/files');const j=await r.json();FILES=j.items||[];if(j.error)toast(j.error);render()}catch(e){}}
+const SUBX=['srt','ass','ssa','vtt'],VIDX=['mkv','mp4','m4v','mov','webm','avi','ogv'];
+const ext=n=>{const i=n.lastIndexOf('.');return i<0?'':n.slice(i+1).toLowerCase()};
+function mkSrc(root,exts,onPick){let mode='storage',sel=null;const inp=root.querySelector('.pk-in'),lst=root.querySelector('.pk-list'),uin=root.querySelector('.u-in'),box=root.querySelector('.pk');
+ function show(){const q=inp.value.toLowerCase(),L=FILES.filter(f=>exts.includes(ext(f.name))&&f.name.toLowerCase().includes(q)).slice(0,60);
+  lst.innerHTML=L.length?L.map((f,i)=>'<div role="option" data-i="'+i+'"><span>'+esc(f.name)+'</span><small>'+fmt(f.size)+'</small></div>').join(''):'<div class="none">No matching files in storage</div>';lst._L=L;lst.hidden=false;inp.setAttribute('aria-expanded','true')}
+ function hide(){lst.hidden=true;inp.setAttribute('aria-expanded','false')}
+ function pick(f){sel=f.name;inp.value=f.name;hide();if(onPick)onPick(f.name)}
+ inp.addEventListener('focus',show);inp.addEventListener('blur',hide);inp.addEventListener('input',()=>{sel=null;show()});
+ inp.addEventListener('keydown',e=>{if(e.key==='Escape')hide();if(e.key==='Enter'&&!lst.hidden&&(lst._L||[]).length){e.preventDefault();pick(lst._L[0])}});
+ lst.addEventListener('mousedown',e=>{const d=e.target.closest('[data-i]');if(d){e.preventDefault();pick(lst._L[+d.dataset.i])}});
+ root.querySelectorAll('.seg button').forEach(b=>b.onclick=()=>{mode=b.dataset.m;root.querySelectorAll('.seg button').forEach(x=>x.setAttribute('aria-pressed',x===b));box.hidden=mode!=='storage';uin.hidden=mode!=='url'});
+ return{get(){if(mode==='url'){const v=uin.value.trim();return v?{type:'url',value:v}:null}const n=sel||(FILES.find(f=>f.name===inp.value)||{}).name;return n?{type:'storage',value:n}:null}}}
+const vs=mkSrc($('srcV'),VIDX,n=>{const o=$('oname');if(!o._m){const i=n.lastIndexOf('.');o.value=(i>0?n.slice(0,i):n)+'_sub.mkv'}}),ss=mkSrc($('srcS'),SUBX);
+$('oname').addEventListener('input',e=>{e.target._m=!!e.target.value});
+$('mux').onclick=async()=>{const v=vs.get(),s=ss.get();if(!v)return toast('Choose a video');if(!s)return toast('Choose a subtitle file');
+ const name=$('oname').value.trim();$('mux').disabled=true;const x=xfer(name||v.value.split('/').pop());
+ try{const r=await api('/api/subtitle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({video:v,sub:s,name:name,lang:$('lang').value.trim()||'si',track:$('tname').value.trim()})});const j=await r.json();
+  if(!r.ok)x.end('error',j.detail||'Rejected');else poll(j.id,x)}catch(e){x.end('error','Request failed')}
+ $('mux').disabled=false};
 (async()=>{try{const m=await(await fetch('/api/me')).json();if(m.auth_enabled&&!m.authenticated)return location.href='/login?next=%2F';$('who').textContent=m.auth_enabled?m.username:'';if(!m.auth_enabled)$('lo').remove()}catch(e){}load()})();
 </script></body></html>"""
 
@@ -521,7 +672,7 @@ def logout():
 def health():
     return {"status": "ok", "time": time.time(), "hf_configured": bool(hf_api), "repo": HF_REPO or None,
             "auth_enabled": AUTH_ENABLED, "telegram_ok": tg_state["ok"],
-            "fast_upload": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1",
+            "mkvmerge": bool(shutil.which("mkvmerge")), "fast_upload": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1",
             **({"telegram_error": tg_state["error"]} if DEBUG_ERRORS else {})}
 
 @app.get("/api/me")
@@ -606,6 +757,35 @@ async def api_remote(request: Request):
         raise HTTPException(400, str(e) or "Invalid link")
     job = new_job(name or url)
     asyncio.create_task(run_remote(job, url, name))
+    return {"id": job["id"]}
+
+@app.post("/api/subtitle")
+async def api_subtitle(request: Request):
+    require_login(request)
+    if not hf_api:
+        raise HTTPException(500, "HF_TOKEN is not configured")
+    b = await request.json()
+    srcs = []
+    for key in ("video", "sub"):
+        src = b.get(key) or {}
+        kind, val = src.get("type"), str(src.get("value", "")).strip()
+        if kind not in ("storage", "url") or not val:
+            raise HTTPException(400, f"Choose a {key if key == 'video' else 'subtitle'} source")
+        if kind == "url":
+            try:
+                await assert_public(val)
+            except Exception as e:
+                raise HTTPException(400, str(e) or "Invalid link")
+        else:
+            safe_name(val)
+        srcs.append({"type": kind, "value": val})
+    lang = str(b.get("lang") or "si").strip()
+    if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", lang):
+        raise HTTPException(400, "Language must be an ISO code such as si or en")
+    track = " ".join(str(b.get("track") or "").split())[:120]
+    name = str(b.get("name") or "").strip()
+    job = new_job(name or "subtitle merge")
+    asyncio.create_task(run_mux(job, srcs[0], srcs[1], name, lang, track))
     return {"id": job["id"]}
 
 @app.get("/api/jobs/{job_id}")
