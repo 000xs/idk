@@ -45,7 +45,8 @@ except ImportError:
 import aiofiles
 import httpx
 from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response
+from starlette.background import BackgroundTask
 from huggingface_hub import HfApi
 from huggingface_hub.utils import RepositoryNotFoundError
 from telethon import TelegramClient, events
@@ -73,6 +74,8 @@ COOKIE_NAME = os.getenv("COOKIE_NAME", "mc_session")
 PROTECT_DOWNLOADS = env_bool("PROTECT_DOWNLOADS", False)
 DEBUG_ERRORS = env_bool("DEBUG_ERRORS", False)
 STREAM_UPLOAD = env_bool("STREAM_UPLOAD", True)
+STREAM_MODE = os.getenv("STREAM_MODE", "redirect").strip().lower()  # redirect | proxy  (private datasets always proxy)
+GATEWAY_KEY = os.getenv("GATEWAY_KEY", "").strip()  # lets your own gateway call /resolve, /cdn, /download when downloads are protected
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024**3)))
 MAX_FAILED = int(os.getenv("MAX_FAILED_ATTEMPTS", "5"))
 LOCK_SECONDS = int(os.getenv("LOCK_SECONDS", "300"))
@@ -174,8 +177,11 @@ def require_login(request: Request) -> str:
         raise HTTPException(401, "Login required")
     return user
 
+def gateway_ok(request: Request) -> bool:
+    return bool(GATEWAY_KEY) and hmac.compare_digest(request.headers.get("x-gateway-key", "").encode(), GATEWAY_KEY.encode())
+
 def download_guard(request: Request):
-    if PROTECT_DOWNLOADS and AUTH_ENABLED and not get_current_user(request):
+    if PROTECT_DOWNLOADS and AUTH_ENABLED and not get_current_user(request) and not gateway_ok(request):
         return RedirectResponse(f"/login?next={quote(request.url.path, safe='/')}", 302)
 
 failed: dict = {}
@@ -190,6 +196,7 @@ class Pool:
         self.limit_gb, self.enabled, self.source, self.private = float(limit_gb), enabled, source, private
         self.api = HfApi(token=token)
         self.used, self.count, self.error = 0, 0, None
+        self.reserved = 0  # bytes of uploads in flight
 
     @property
     def limit(self) -> int:
@@ -197,7 +204,7 @@ class Pool:
 
     @property
     def free(self) -> int:
-        return max(0, self.limit - self.used)
+        return max(0, self.limit - self.used - self.reserved)
 
     def public(self) -> dict:
         t = self.token
@@ -293,8 +300,27 @@ def links(name: str, request=None, pool: Pool = None) -> dict:
     return {"download_url": hf_url(name, pool, True), "cdn_url": hf_url(name, pool)}
 
 # ───────────────────────── File index across pools ─────────────────────────
-_cache = {"t": 0.0, "items": []}
+# INDEX: file name -> {"name", "size", "pool", "ts"}.
+# Public links read INDEX only (no Hugging Face call). A background task refreshes it, uploads and
+# deletes update it instantly, and a miss falls back to a cheap HEAD probe of every account.
+INDEX: dict = {}
+_cache = {"t": 0.0}  # t=0 forces the next list_files() to refresh
 _list_lock = asyncio.Lock()
+_alloc_lock = asyncio.Lock()
+_neg: dict = {}
+_http_c = None
+ALLOC_STRATEGY = os.getenv("ALLOC_STRATEGY", "most_free").strip().lower()  # most_free | fill_first
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "60"))
+
+def _http() -> httpx.AsyncClient:
+    global _http_c
+    if _http_c is None:
+        _http_c = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(15, read=60),
+                                    headers={"User-Agent": "Mozilla/5.0 (MyCloud)"})
+    return _http_c
+
+def _auth(p: Pool) -> dict:
+    return {"Authorization": f"Bearer {p.token}"} if p.token else {}
 
 def _list_pool_sync(p: Pool):
     out = []
@@ -303,41 +329,83 @@ def _list_pool_sync(p: Pool):
         if size is None or e.path.startswith(".") or e.path in {"README.md", ".gitattributes"}:
             continue
         out.append({"name": e.path, "size": size, "pool": p.id})
+    if p.private is None:
+        try:
+            p.private = bool(p.api.repo_info(repo_id=p.repo, repo_type="dataset").private)
+        except Exception:
+            pass
     return out
 
+def _items() -> list:
+    return sorted(INDEX.values(), key=lambda x: x["name"].lower())
+
 async def list_files(max_age: float = 5):
+    """Rebuild INDEX from every account (used by the dashboard and the background refresher, never by public links)."""
+    if time.time() - _cache["t"] <= max_age:
+        return _items()
     async with _list_lock:
-        if time.time() - _cache["t"] > max_age:
-            pools = list(POOLS.values())
-            res = await asyncio.gather(*[asyncio.to_thread(_list_pool_sync, p) for p in pools], return_exceptions=True)
-            items, seen = [], set()
-            for p, r in zip(pools, res):
-                if isinstance(r, Exception):
-                    p.error, p.used, p.count = (str(r) or type(r).__name__)[:200], 0, 0
-                    continue
-                p.error, p.used, p.count = None, sum(f["size"] for f in r), len(r)
-                for f in r:
-                    if f["name"] not in seen:
-                        seen.add(f["name"])
-                        items.append(f)
-            items.sort(key=lambda x: x["name"].lower())
-            _cache.update(items=items, t=time.time())
-    return _cache["items"]
+        if time.time() - _cache["t"] <= max_age:
+            return _items()
+        t_start = time.time()
+        pools = list(POOLS.values())
+        res = await asyncio.gather(*[asyncio.to_thread(_list_pool_sync, p) for p in pools], return_exceptions=True)
+        new, bad = {}, set()
+        for p, r in zip(pools, res):
+            if isinstance(r, Exception):
+                p.error = (str(r) or type(r).__name__)[:200]
+                bad.add(p.id)
+                continue
+            p.error, p.used, p.count = None, sum(f["size"] for f in r), len(r)
+            for f in r:
+                new.setdefault(f["name"], {**f, "ts": 0})
+        for k, v in INDEX.items():  # keep unreachable accounts' files and files added while we were listing
+            if k not in new and (v["pool"] in bad or v.get("ts", 0) >= t_start):
+                new[k] = v
+        INDEX.clear()
+        INDEX.update(new)
+        _cache["t"] = time.time()
+    return _items()
+
+async def refresher():
+    while True:
+        await asyncio.sleep(max(15, REFRESH_SECONDS))
+        try:
+            await list_files(0)
+        except Exception as e:
+            log.warning("Index refresh failed: %s", e)
+
+async def _probe_one(name: str, p: Pool):
+    try:
+        r = await _http().head(hf_url(name, p), headers=_auth(p))
+        if r.status_code in (200, 301, 302, 307, 308):
+            return p, int(r.headers.get("x-linked-size") or r.headers.get("content-length") or 0)
+    except Exception:
+        pass
+    return None
 
 async def locate(name: str):
-    """Which pool holds this file? Returns a Pool or None."""
-    for age in (30, 5):
-        f = next((f for f in await list_files(age) if f["name"] == name), None)
-        if f:
-            return POOLS.get(f["pool"])
+    """Which account holds this file? Index first, then a HEAD probe of every account. Returns a Pool or None."""
+    f = INDEX.get(name)
+    if f and f["pool"] in POOLS:
+        return POOLS[f["pool"]]
+    if _neg.get(name, 0) > time.time():
+        return None
+    for hit in await asyncio.gather(*[_probe_one(name, p) for p in POOLS.values()]):
+        if hit:
+            p, size = hit
+            INDEX[name] = {"name": name, "size": size, "pool": p.id, "ts": time.time()}
+            return p
+    if len(_neg) > 5000:
+        _neg.clear()
+    _neg[name] = time.time() + 10
     return None
 
 async def choose_pool(size: int, name: str = None, preferred: str = None) -> Pool:
-    """Replace in place if the file exists; else the chosen pool; else the pool with the most free space."""
+    """Replace in place if the file exists; else the chosen account; else by ALLOC_STRATEGY."""
     if not POOLS:
         raise ValueError("No storage account is connected yet. Add one on the Storage page.")
-    items = await list_files(10)
-    old = next((f for f in items if f["name"] == name), None) if name else None
+    await list_files(30)
+    old = INDEX.get(name) if name else None
     if old and old["pool"] in POOLS:
         return POOLS[old["pool"]]
     ok = [p for p in POOLS.values() if p.enabled and not p.error and p.free >= size]
@@ -348,7 +416,25 @@ async def choose_pool(size: int, name: str = None, preferred: str = None) -> Poo
         raise ValueError("The chosen account is paused, unreachable or out of space. Pick another or use Automatic.")
     if not ok:
         raise ValueError("No connected account has enough free space. Add another account on the Storage page.")
-    return max(ok, key=lambda p: p.free)
+    return ok[0] if ALLOC_STRATEGY == "fill_first" else max(ok, key=lambda p: p.free)
+
+@asynccontextmanager
+async def allocate(size: int, name: str = None, preferred: str = None):
+    """Pick an account and reserve `size` bytes on it while the upload runs, so parallel uploads can't overfill it."""
+    async with _alloc_lock:
+        pool = await choose_pool(size, name, preferred)
+        pool.reserved += size
+    try:
+        yield pool
+        if name:
+            old = INDEX.get(name)
+            same = bool(old and old["pool"] == pool.id)
+            pool.used += size - (old["size"] if same else 0)
+            pool.count += 0 if same else 1
+            INDEX[name] = {"name": name, "size": size, "pool": pool.id, "ts": time.time()}
+        _neg.pop(name, None)
+    finally:
+        pool.reserved = max(0, pool.reserved - size)
 
 async def pick(size, name=None, preferred=None) -> Pool:
     try:
@@ -356,10 +442,13 @@ async def pick(size, name=None, preferred=None) -> Pool:
     except ValueError as e:
         raise HTTPException(507, str(e))
 
-async def push_to_hf(path, name: str, note: str, pool: Pool):
-    await asyncio.to_thread(pool.api.upload_file, path_or_fileobj=str(path), path_in_repo=name,
-                            repo_id=pool.repo, repo_type="dataset", commit_message=f"{note}: {name}")
-    _cache["t"] = 0
+async def store(path, name: str, note: str, preferred: str = None) -> Pool:
+    """Upload a local file to the best account. Returns the Pool it was saved to."""
+    size = Path(path).stat().st_size
+    async with allocate(size, name, preferred) as pool:
+        await asyncio.to_thread(pool.api.upload_file, path_or_fileobj=str(path), path_in_repo=name,
+                                repo_id=pool.repo, repo_type="dataset", commit_message=f"{note}: {name}")
+    return pool
 
 # ───────────────────────── Jobs (URL import) ─────────────────────────
 JOBS: dict = {}
@@ -432,8 +521,7 @@ async def run_remote(job: dict, url: str, name: str, preferred: str = ""):
             finally:
                 await resp.aclose()
         job.update(stage="uploading", total=job["done"], speed=0)
-        pool = await choose_pool(job["done"], fname, preferred or None)
-        await push_to_hf(tmp, fname, "URL import", pool)
+        pool = await store(tmp, fname, "URL import", preferred or None)
         job.update(stage="done", **links(fname, pool=pool))
         log.info("URL import OK: %s (%.1f MB) -> %s", fname, job["done"] / 1048576, pool.label)
     except Exception as e:
@@ -515,7 +603,7 @@ async def run_mux(job: dict, v: dict, sub: dict, out_name: str, lang: str, track
             raise ValueError("mkvmerge is not installed on the server (install the mkvtoolnix package)")
         job.update(stage="working", label="Waiting for another merge to finish", pct=None)
         async with MUX_SEM:
-            size = next((f["size"] for f in _cache["items"] if v["type"] == "storage" and f["name"] == v["value"]), 0)
+            size = INDEX.get(v["value"], {}).get("size", 0) if v["type"] == "storage" else 0
             work = pick_tmp((size or 2 * 1024**3) * 2) / f"mux_{job['id']}"
             work.mkdir(parents=True, exist_ok=True)
             vpath, vname = await fetch_source(job, v, work / "video", "video", ".mkv")
@@ -540,9 +628,8 @@ async def run_mux(job: dict, v: dict, sub: dict, out_name: str, lang: str, track
             if rc >= 2 or not out.exists():
                 msg = re.sub(r"Progress: \d+%\s*", "", tail.decode("utf-8", "replace")).strip()[-300:]
                 raise ValueError("mkvmerge failed: " + msg)
-            pool = await choose_pool(out.stat().st_size, out_name)
-            job.update(label=f"Saving to {pool.label}…", pct=None)
-            await push_to_hf(out, out_name, "Subtitle mux", pool)
+            job.update(label="Saving to storage…", pct=None)
+            pool = await store(out, out_name, "Subtitle mux")
         job.update(stage="done", label=None, **links(out_name, pool=pool))
         log.info("Subtitle mux OK: %s", out_name)
     except Exception as e:
@@ -560,7 +647,7 @@ async def run_burn(job: dict, v: dict, sub: dict, out_name: str, font: str, size
             raise ValueError("ffmpeg is not installed on the server (add ffmpeg to the Dockerfile)")
         job.update(stage="working", label="Waiting for another job to finish", pct=None)
         async with MUX_SEM:
-            hint = next((f["size"] for f in _cache["items"] if v["type"] == "storage" and f["name"] == v["value"]), 0)
+            hint = INDEX.get(v["value"], {}).get("size", 0) if v["type"] == "storage" else 0
             work = pick_tmp((hint or 2 * 1024**3) * 2) / f"burn_{job['id']}"
             work.mkdir(parents=True, exist_ok=True)
             vpath, vname = await fetch_source(job, v, work / "video", "video", ".mkv")
@@ -594,9 +681,8 @@ async def run_burn(job: dict, v: dict, sub: dict, out_name: str, font: str, size
             if rc != 0 or not out.exists():
                 msg = re.sub(rb"[a-z_0-9]+=\S*\s*", b"", tail).decode("utf-8", "replace").strip()[-300:]
                 raise ValueError("ffmpeg failed: " + msg)
-            pool = await choose_pool(out.stat().st_size, out_name)
-            job.update(label=f"Saving to {pool.label}…", pct=None)
-            await push_to_hf(out, out_name, "Hardsub", pool)
+            job.update(label="Saving to storage…", pct=None)
+            pool = await store(out, out_name, "Hardsub")
         job.update(stage="done", label=None, **links(out_name, pool=pool))
         log.info("Hardsub OK: %s", out_name)
     except Exception as e:
@@ -622,6 +708,8 @@ async def start_telegram():
 @asynccontextmanager
 async def lifespan(app):
     await load_pools()
+    asyncio.create_task(list_files(0))
+    asyncio.create_task(refresher())
     if client:
         register_telegram()
         asyncio.create_task(start_telegram())
@@ -1058,7 +1146,9 @@ async def api_delete(request: Request, name: str):
                                 repo_type="dataset", commit_message=f"Delete: {name}")
     except Exception as e:
         raise HTTPException(500, str(e))
-    _cache["t"] = 0
+    old = INDEX.pop(name, None)
+    if old:
+        pool.used, pool.count = max(0, pool.used - old["size"]), max(0, pool.count - 1)
     return {"success": True}
 
 @app.post("/api/upload")
@@ -1085,9 +1175,11 @@ async def api_upload(request: Request, name: str = "", pool: str = ""):
                 await out.write(chunk)
         if size == 0:
             raise HTTPException(400, "Empty upload")
-        target = await pick(size, fname, pool)
         t0 = time.time()
-        await push_to_hf(tmp, fname, "Web upload", target)
+        try:
+            target = await store(tmp, fname, "Web upload", pool or None)
+        except ValueError as e:
+            raise HTTPException(507, str(e))
         log.info("Web upload %s: %.1f MB -> %s in %.1fs", fname, size / 1048576, target.label, time.time() - t0)
         return {"success": True, "filename": fname, "size": size, "account": target.label, **links(fname, request, target)}
     except HTTPException:
@@ -1284,19 +1376,55 @@ async def api_pool_remove(request: Request, pid: str):
     return {"success": True}
 
 # ── public links (resolved to whichever account holds the file)
-@app.get("/cdn/{filename:path}")
-async def cdn(request: Request, filename: str):
-    guard = download_guard(request)
-    if guard:
-        return guard
-    name = safe_name(filename)
-    pool = await locate(name)
-    if not pool:
-        raise HTTPException(404, "File not found")
-    return RedirectResponse(hf_url(name, pool), 302)
+PASS_HEADERS = ("content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified", "content-encoding")
+CORS = {"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges"}
 
-@app.get("/download/{filename:path}")
-async def download(request: Request, filename: str):
+async def proxy_file(request: Request, pool: Pool, name: str, download: bool):
+    """Stream the file through this server with Range support (used for private datasets or STREAM_MODE=proxy)."""
+    fwd = {k: request.headers[k] for k in ("range", "if-range", "if-none-match", "if-modified-since") if k in request.headers}
+    http = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(30, read=300),
+                             headers={"User-Agent": "Mozilla/5.0 (MyCloud)"})
+    r = None
+    try:
+        cur, auth = hf_url(name, pool, download), _auth(pool)
+        for _ in range(5):
+            r = await http.send(http.build_request(request.method, cur, headers={**fwd, **auth}), stream=True)
+            if r.status_code in (301, 302, 303, 307, 308):
+                nxt = urljoin(cur, r.headers.get("location", ""))
+                await r.aclose()
+                if urlsplit(nxt).hostname != urlsplit(cur).hostname:
+                    auth = {}  # never send the token to the CDN host
+                cur, r = nxt, None
+                continue
+            break
+        if r is None:
+            raise ValueError("Too many redirects")
+    except Exception as e:
+        await http.aclose()
+        log.error("Proxy failed for %s: %s", name, e)
+        raise HTTPException(502, "Could not reach the storage account")
+    if r.status_code == 404:
+        await r.aclose(); await http.aclose()
+        raise HTTPException(404, "File not found")
+    headers = {k: r.headers[k] for k in PASS_HEADERS if k in r.headers}
+    headers.setdefault("accept-ranges", "bytes")
+    ctype = mimetypes.guess_type(name)[0]
+    if ctype and not download:
+        headers["content-type"] = ctype
+    if download:
+        headers["content-disposition"] = "attachment; filename*=UTF-8''" + quote(name)
+    headers.update(CORS)
+
+    async def close():
+        await r.aclose()
+        await http.aclose()
+
+    if request.method == "HEAD":
+        await close()
+        return Response(status_code=r.status_code, headers=headers)
+    return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers=headers, background=BackgroundTask(close))
+
+async def serve(request: Request, filename: str, download: bool):
     guard = download_guard(request)
     if guard:
         return guard
@@ -1304,7 +1432,36 @@ async def download(request: Request, filename: str):
     pool = await locate(name)
     if not pool:
         raise HTTPException(404, "File not found")
-    return RedirectResponse(hf_url(name, pool, True), 302)
+    if STREAM_MODE == "proxy" or pool.private:
+        return await proxy_file(request, pool, name, download)
+    return RedirectResponse(hf_url(name, pool, download), 307, headers={**CORS, "Cache-Control": "private, max-age=300"})
+
+@app.api_route("/cdn/{filename:path}", methods=["GET", "HEAD", "OPTIONS"])
+async def cdn(request: Request, filename: str):
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={**CORS, "Access-Control-Allow-Headers": "Range, X-Gateway-Key"})
+    return await serve(request, filename, False)
+
+@app.api_route("/download/{filename:path}", methods=["GET", "HEAD", "OPTIONS"])
+async def download(request: Request, filename: str):
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={**CORS, "Access-Control-Allow-Headers": "Range, X-Gateway-Key"})
+    return await serve(request, filename, True)
+
+@app.api_route("/resolve/{filename:path}", methods=["GET", "HEAD"])
+async def resolve(request: Request, filename: str):
+    """For your own gateway: which dataset holds this file? Never returns tokens."""
+    if PROTECT_DOWNLOADS and AUTH_ENABLED and not (get_current_user(request) or gateway_ok(request)):
+        raise HTTPException(401, "Not allowed")
+    name = safe_name(filename)
+    pool = await locate(name)
+    if not pool:
+        raise HTTPException(404, "File not found")
+    private = bool(pool.private)
+    return JSONResponse({"name": name, "size": INDEX.get(name, {}).get("size", 0), "repo": pool.repo, "private": private,
+                         "direct_url": None if private else hf_url(name, pool),
+                         "direct_download_url": None if private else hf_url(name, pool, True)},
+                        headers={**CORS, "Cache-Control": "public, max-age=60"})
 
 class RemoteStream(io.BufferedIOBase):
     """Seekable file-like object with NO disk usage.
@@ -1438,10 +1595,10 @@ def register_telegram():
 
             rep = asyncio.create_task(report())
             try:
-                await asyncio.to_thread(pool.api.upload_file, path_or_fileobj=stream, path_in_repo=fname,
-                                        repo_id=pool.repo, repo_type="dataset",
-                                        commit_message=f"Telegram stream upload: {fname}")
-                _cache["t"] = 0
+                async with allocate(total, fname, pool.id) as pool:
+                    await asyncio.to_thread(pool.api.upload_file, path_or_fileobj=stream, path_in_repo=fname,
+                                            repo_id=pool.repo, repo_type="dataset",
+                                            commit_message=f"Telegram stream upload: {fname}")
                 l = links(fname, pool=pool)
                 await edit(f"Done: {fname} ({total / 1048576:.1f} MB) saved to {pool.label}\n\nDownload:\n{l['download_url']}\n\nStream:\n{l['cdn_url']}")
                 log.info("TG STREAM upload OK %s: %.1f MB in %.1fs -> %s", fname, total / 1048576, time.time() - t0, pool.label)
@@ -1456,7 +1613,7 @@ def register_telegram():
             size = tmp.stat().st_size
             t1 = time.time()
             await edit(f"Saving {size / 1048576:.0f} MB to {pool.label}…")
-            await push_to_hf(tmp, fname, "Telegram upload", pool)
+            pool = await store(tmp, fname, "Telegram upload")
             l = links(fname, pool=pool)
             await edit(f"Done: {fname} ({size / 1048576:.1f} MB) saved to {pool.label}\n\nDownload:\n{l['download_url']}\n\nStream:\n{l['cdn_url']}")
             log.info("TG upload %s: dl %.1fs, push %.1fs", fname, t1 - t0, time.time() - t1)
