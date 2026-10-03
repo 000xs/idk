@@ -7,3 +7,4 @@ cryptg
 huggingface_hub
 hf_transfer
 python-multipart
+cryptography
