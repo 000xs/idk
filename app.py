@@ -28,6 +28,7 @@ import secrets
 import ipaddress
 import mimetypes
 import traceback
+import tempfile
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
@@ -37,6 +38,7 @@ from urllib.parse import quote, unquote, urlsplit, urljoin
 if os.getenv("STREAM_UPLOAD", "true").strip().lower() in {"1", "true", "yes", "on"}:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+os.environ.setdefault("LC_ALL", "C.UTF-8")  # keeps non-ASCII file names intact in 7z / unrar subprocesses
 try:
     import hf_transfer  # noqa: F401
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -704,6 +706,7 @@ SUB_EXT = {".srt", ".ass", ".ssa", ".vtt"}
 MUX_VIDEO_EXT = VIDEO_EXT | {".avi"}
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 STAGES: dict = {}
+_pending = {"n": 0}  # archives currently being downloaded from a link
 
 class ZipLocked(Exception):
     pass
@@ -765,6 +768,207 @@ def _extract_sync(zip_path: str, idx: int, password: str, dest: Path):
         with zf.open(zi, pwd=password.encode() if password else None) as src, open(dest, "wb") as out:
             shutil.copyfileobj(src, out, 1024 * 1024)
 
+def _entry(i: int, raw: str, size: int):
+    parts = [p for p in raw.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+    if not parts:
+        return None
+    base = parts[-1]
+    ext = Path(base).suffix.lower()
+    junk = "__MACOSX" in parts or base.lower() in JUNK_NAMES or base.startswith("._")
+    kind = "video" if ext in MUX_VIDEO_EXT else "sub" if ext in SUB_EXT else "other"
+    return {"i": i, "path": "/".join(parts), "name": base, "size": int(size), "kind": kind, "junk": junk}
+
+def _finish(files: list, total: int) -> list:
+    if not files:
+        raise ValueError("This archive is empty")
+    if len(files) > ZIP_MAX_FILES:
+        raise ValueError(f"This archive has more than {ZIP_MAX_FILES} files")
+    if total > ZIP_MAX_EXTRACT:
+        raise ValueError(f"This archive unpacks to {human(total)}, over the {human(ZIP_MAX_EXTRACT)} limit")
+    return files
+
+def _need_lib(mod: str, pip: str):
+    try:
+        return __import__(mod)
+    except ImportError:
+        raise ValueError(f"{mod} is not installed on the server (pip install {pip})")
+
+def _is_pw_error(e: Exception) -> bool:
+    return "password" in type(e).__name__.lower() or "password" in str(e).lower()
+
+def _scan_7z(path: str, password: str):
+    py7zr = _need_lib("py7zr", "py7zr")
+    try:
+        z = py7zr.SevenZipFile(path, mode="r", password=password or None)
+    except Exception as e:
+        if _is_pw_error(e):
+            raise ZipLocked("Wrong password" if password else "This archive is password protected")
+        raise ValueError(f"Could not read this 7z archive: {str(e)[:150] or type(e).__name__}")
+    files, total, probe = [], 0, None
+    with z:
+        try:
+            enc = bool(z.needs_password())
+        except Exception:
+            enc = False
+        for i, f in enumerate(z.list()):
+            if getattr(f, "is_directory", False):
+                continue
+            size = getattr(f, "uncompressed", 0) or 0
+            size = sum(size) if isinstance(size, (list, tuple)) else size
+            e = _entry(i, f.filename, size)
+            if e:
+                files.append(e)
+                total += e["size"]
+                if probe is None and 0 < e["size"] <= 1024**3:
+                    probe = f.filename
+    if enc:
+        if not password:
+            raise ZipLocked("This archive is password protected")
+        if probe:  # verify the password by decoding the first small file
+            tmp = tempfile.mkdtemp(dir=str(Path(path).parent))
+            try:
+                with py7zr.SevenZipFile(path, mode="r", password=password) as z2:
+                    z2.extract(path=tmp, targets=[probe])
+            except Exception:
+                raise ZipLocked("Wrong password, or the archive is damaged")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+    return _finish(files, total)
+
+def _rar_setup(rarfile):
+    """Pick one extraction tool for rarfile: unrar (also handles passwords), else bsdtar, else unar."""
+    if shutil.which("unrar"):
+        kw = dict(unar=False, bsdtar=False, sevenzip=False, sevenzip2=False)
+    elif shutil.which("bsdtar"):
+        kw = dict(unrar=False, unar=False, sevenzip=False, sevenzip2=False)
+    elif shutil.which("unar"):
+        kw = dict(unrar=False, bsdtar=False, sevenzip=False, sevenzip2=False)
+    elif any(shutil.which(x) for x in ("7z", "7zz", "7za")):
+        kw = {}
+    else:
+        raise ValueError("To open RAR files the server needs bsdtar (package libarchive-tools) or unrar installed")
+    try:
+        rarfile.tool_setup(force=True, **kw)
+    except Exception:
+        pass
+
+def _scan_rar(path: str, password: str):
+    rarfile = _need_lib("rarfile", "rarfile")
+    _rar_setup(rarfile)
+    try:
+        rf = rarfile.RarFile(path)
+    except rarfile.PasswordRequired:
+        raise ValueError("This RAR hides its file list behind a password, which is not supported")
+    except rarfile.NeedFirstVolume:
+        raise ValueError("This looks like a later part of a multi-part RAR. Multi-part archives are not supported")
+    except Exception as e:
+        raise ValueError(f"Could not read this RAR: {str(e)[:150] or type(e).__name__}")
+    files, total, first_enc = [], 0, None
+    with rf:
+        infos = rf.infolist()
+        for i, ri in enumerate(infos):
+            isdir = getattr(ri, "is_dir", None) or ri.isdir
+            if isdir():
+                continue
+            e = _entry(i, ri.filename, ri.file_size)
+            if not e:
+                continue
+            files.append(e)
+            total += e["size"]
+            if first_enc is None and ri.needs_password():
+                first_enc = ri
+        if first_enc is not None:
+            if not password:
+                raise ZipLocked("This archive is password protected")
+            try:
+                with rf.open(first_enc, pwd=password) as fh:
+                    fh.read(1)
+            except rarfile.RarCannotExec:
+                raise ValueError("Password-protected RAR files need unrar installed on the server")
+            except Exception:
+                raise ZipLocked("Wrong password")
+    return _finish(files, total)
+
+def detect_kind(path: str):
+    if zipfile.is_zipfile(path):
+        return "zip"
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head[:6] == b"Rar!\x1a\x07":
+        return "rar"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    return None
+
+def scan_archive(kind: str, path: str, password: str):
+    try:
+        if kind == "zip":
+            return _scan_zip(path, password)
+        return _scan_7z(path, password) if kind == "7z" else _scan_rar(path, password)
+    except (ZipLocked, ValueError):
+        raise
+    except zipfile.BadZipFile:
+        raise ValueError("This archive is damaged or incomplete")
+    except Exception as e:
+        raise ValueError(f"Could not read this archive: {str(e)[:150] or type(e).__name__}")
+
+def _find_extracted(root: Path, name: str, size: int) -> Path:
+    cand = root / name.replace("\\", "/")
+    try:
+        if cand.is_file() and str(cand.resolve()).startswith(str(root.resolve())):
+            return cand
+    except OSError:
+        pass
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    for p in root.rglob("*"):
+        if p.is_file() and p.name == base and p.stat().st_size == size:
+            return p
+    raise ValueError("The file was not found after extracting")
+
+def extract_batch(kind: str, path: str, password: str, bdir: Path, files: list) -> dict:
+    """Extract several members in ONE pass (important for solid 7z/rar). Returns {member index: file on disk}."""
+    dests = {f["i"]: bdir / ("m%d%s" % (f["i"], _ext(f["name"], {"sub": ".srt", "video": ".mkv"}.get(f["kind"], ".bin")))) for f in files}
+    if kind == "zip":
+        for i, d in dests.items():
+            _extract_sync(path, i, password, d)
+        return dests
+    sizes, tmp = {f["i"]: f["size"] for f in files}, bdir / "x"
+    tmp.mkdir(exist_ok=True)
+    if kind == "7z":
+        py7zr = _need_lib("py7zr", "py7zr")
+        with py7zr.SevenZipFile(path, mode="r", password=password or None) as z:
+            names = {i: f.filename for i, f in enumerate(z.list())}
+            z.extract(path=str(tmp), targets=[names[i] for i in dests])
+    else:
+        rarfile = _need_lib("rarfile", "rarfile")
+        _rar_setup(rarfile)
+        with rarfile.RarFile(path) as rf:
+            infos = rf.infolist()
+            names = {i: infos[i].filename for i in dests}
+            try:
+                rf.extractall(path=str(tmp), members=[infos[i] for i in dests], pwd=password or None)
+            except rarfile.RarCannotExec:
+                raise ValueError("The server needs bsdtar (libarchive-tools) or unrar installed to extract RAR files")
+    for i, d in dests.items():
+        shutil.move(str(_find_extracted(tmp, names[i], sizes[i])), str(d))
+    shutil.rmtree(tmp, ignore_errors=True)
+    return dests
+
+async def build_stage(sid: str, name: str, d: Path, path: Path, size: int, password: str) -> dict:
+    """Identify and list an archive, then register it as a stage. Raises ValueError if it can't be read."""
+    kind = await asyncio.to_thread(detect_kind, str(path))
+    if not kind:
+        raise ValueError("That file is not a ZIP, RAR or 7z archive")
+    st = {"id": sid, "name": name, "dir": d, "path": str(path), "size": size, "kind": kind, "files": [], "locked": False,
+          "password": "", "seen": time.time(), "job": None}
+    try:
+        st["files"] = await asyncio.to_thread(scan_archive, kind, str(path), password)
+        st["password"] = password
+    except ZipLocked as e:
+        st["locked"], st["lock_msg"] = True, str(e)
+    STAGES[sid] = st
+    return st
+
 def target_name(path: str, naming: str, used: set) -> str:
     """Flat, safe, unique file name for the dataset."""
     parts = path.split("/")
@@ -788,7 +992,7 @@ def _stage_running(st) -> bool:
     return bool(j and j["stage"] not in ("done", "error"))
 
 def stage_public(st, files=True) -> dict:
-    d = {"id": st["id"], "name": st["name"], "size": st["size"], "locked": st["locked"], "lock_msg": st.get("lock_msg", ""),
+    d = {"id": st["id"], "name": st["name"], "size": st["size"], "kind": st["kind"], "locked": st["locked"], "lock_msg": st.get("lock_msg", ""),
          "count": len(st["files"]), "total_size": sum(f["size"] for f in st["files"]),
          "expires": int(st["seen"] + ZIP_TTL), "job": st.get("job") if _stage_running(st) else None}
     if files:
@@ -849,71 +1053,149 @@ async def mkvmerge_local(item: dict, vpath: Path, spath: Path, out: Path, lang: 
         msg = re.sub(r"Progress: \d+%\s*", "", tail.decode("utf-8", "replace")).strip()[-300:]
         raise ValueError("mkvmerge failed: " + msg)
 
+def _step_files(step: dict) -> list:
+    return [x for x in (step.get("file"), step.get("sub")) if x]
+
+def _step_cost(step: dict) -> int:
+    f, sub = step["file"], step.get("sub")
+    return f["size"] + ((sub["size"] + f["size"]) if sub else 0)  # + the merged output
+
 async def run_zip_job(job: dict, st: dict, mode: str, plan: list, o: dict):
-    items, pw, pref = job["items"], st.get("password", ""), o.get("preferred") or None
+    items, pw, pref, kind = job["items"], st.get("password", ""), o.get("preferred") or None, st["kind"]
+    MB = 1024 ** 2
 
     def progress():
         done = sum(1 for x in items if x["state"] in ("done", "error"))
         cur = sum((x.get("pct") or 0) / 100 for x in items if x["state"] == "working")
         job["pct"] = min(99, int((done + cur) * 100 / max(1, len(items))))
 
-    async def extract_to(f: dict, dest: Path, factor: float = 1.05):
-        if shutil.disk_usage(dest.parent).free < int(f["size"] * factor) + 64 * 1024**2:
-            raise ValueError("Not enough temporary disk space on the server for this file")
-        await asyncio.to_thread(_extract_sync, st["path"], f["i"], pw, dest)
+    def fail(idxs, e):
+        for j in idxs:
+            items[j].update(state="error", msg=(str(e) or type(e).__name__)[:300], pct=None)
 
     try:
-        for k, step in enumerate(plan):
-            it, work = items[k], None
-            it.update(state="working", pct=None, msg="")
-            job["label"] = f"Item {k + 1} of {len(items)}"
-            progress()
+        if mode == "zip":  # save the archive file itself
+            items[0].update(state="working", msg="Uploading")
             try:
-                if mode == "zip":
-                    it["msg"] = "Uploading"
-                    pool = await store(st["path"], step["target"], "Zip upload", pref)
-                elif step.get("sub") is None:  # plain extract, or a video kept without subtitles
-                    f = step["file"]
-                    if f["size"] == 0:
-                        raise ValueError("Empty file, skipped")
-                    it["msg"] = "Extracting"
-                    work = pick_tmp(f["size"]) / f"zipx_{job['id']}_{k}"
-                    await extract_to(f, work)
-                    it["msg"] = "Uploading"
-                    pool = await store(work, step["target"], "Zip extract", pref)
-                else:  # soft-sub merge
-                    f, sub = step["file"], step["sub"]
-                    if f["size"] == 0:
-                        raise ValueError("Empty video file")
-                    work = pick_tmp(int(f["size"] * 2.2) + sub["size"]) / f"zipm_{job['id']}_{k}"
-                    work.mkdir(parents=True, exist_ok=True)
-                    vpath = work / ("video" + _ext(f["name"], ".mkv"))
-                    spath = work / ("sub" + _ext(sub["name"], ".srt"))
-                    it["msg"] = "Extracting"
-                    await extract_to(f, vpath, 2.2)
-                    await asyncio.to_thread(_extract_sync, st["path"], sub["i"], pw, spath)
-                    it.update(msg="Merging subtitles", pct=0)
-                    async with MUX_SEM:
-                        await mkvmerge_local(it, vpath, spath, work / "out.mkv", o["lang"], o["track"])
-                    it.update(msg="Uploading", pct=None)
-                    pool = await store(work / "out.mkv", step["target"], "Zip subtitle mux", pref)
-                it.update(state="done", msg=pool.label, pct=None)
-                log.info("Zip item saved: %s -> %s", step["target"], pool.label)
+                pool = await store(st["path"], plan[0]["target"], "Archive upload", pref)
+                items[0].update(state="done", msg=pool.label)
             except Exception as e:
-                it.update(state="error", msg=(str(e) or type(e).__name__)[:300], pct=None)
-                log.error("Zip item failed (%s): %s", step["target"], e)
-            finally:
-                if work:
-                    shutil.rmtree(work, ignore_errors=True) if work.is_dir() else work.unlink(missing_ok=True)
-            progress()
+                fail([0], e)
+                log.error("Archive upload failed: %s", e)
+        else:
+            k = 0
+            while k < len(plan):
+                # Solid 7z/rar must be read in one pass, so extract a whole batch that fits on disk; zip is random access.
+                first = _step_cost(plan[k])
+                base = pick_tmp(first)
+                free = shutil.disk_usage(base).free
+                budget = int(free * 0.85) - 128 * MB
+                end, total = k + 1, first
+                while kind != "zip" and end < len(plan) and total + _step_cost(plan[end]) <= budget:
+                    total += _step_cost(plan[end])
+                    end += 1
+                batch, bdir, paths = list(range(k, end)), base / f"zipb_{job['id']}_{k}", None
+                try:
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    for j in batch:
+                        items[j].update(state="working", pct=None, msg="Extracting")
+                    job["label"] = f"Items {k + 1} to {end} of {len(plan)}"
+                    progress()
+                    if first + 64 * MB > free:
+                        raise ValueError("Not enough temporary disk space on the server")
+                    need = {f["i"]: f for j in batch for f in _step_files(plan[j])}
+                    paths = await asyncio.to_thread(extract_batch, kind, st["path"], pw, bdir, list(need.values()))
+                    for j in batch:
+                        items[j].update(state="queued", msg="Extracted, waiting")
+                except Exception as e:
+                    log.error("Extraction failed: %s", e)
+                    fail(batch, e)
+                if paths is not None:
+                    for j in batch:
+                        step, it = plan[j], items[j]
+                        it.update(state="working", msg="Uploading", pct=None)
+                        try:
+                            f = step["file"]
+                            if f["size"] == 0:
+                                raise ValueError("Empty file, skipped")
+                            src = paths[f["i"]]
+                            if step.get("sub") is None:
+                                pool = await store(src, step["target"], "Archive extract", pref)
+                            else:
+                                out = bdir / f"out{j}.mkv"
+                                it.update(msg="Merging subtitles", pct=0)
+                                async with MUX_SEM:
+                                    await mkvmerge_local(it, src, paths[step["sub"]["i"]], out, o["lang"], o["track"])
+                                it.update(msg="Uploading", pct=None)
+                                pool = await store(out, step["target"], "Archive subtitle merge", pref)
+                                out.unlink(missing_ok=True)
+                            it.update(state="done", msg=pool.label, pct=None)
+                            log.info("Archive item saved: %s -> %s", step["target"], pool.label)
+                        except Exception as e:
+                            fail([j], e)
+                            log.error("Archive item failed (%s): %s", step["target"], e)
+                        progress()
+                shutil.rmtree(bdir, ignore_errors=True)
+                progress()
+                k = end
         ok = sum(1 for x in items if x["state"] == "done")
         job.update(stage="done" if ok else "error", pct=100, label=None, error=None if ok else "Nothing was saved")
     except Exception as e:
-        log.error("Zip job crashed: %s", e)
+        log.error("Archive job crashed: %s", e)
         for x in items:
             if x["state"] in ("queued", "working"):
                 x.update(state="error", msg="Stopped unexpectedly")
         job.update(stage="error", error=str(e) or type(e).__name__)
+
+async def run_zip_fetch(job: dict, url: str, password: str):
+    """Download an archive from a link to a temporary file, then list it (nothing is saved to the datasets)."""
+    d = None
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, headers={"User-Agent": "Mozilla/5.0 (MyCloud)"},
+                                     timeout=httpx.Timeout(30, read=120)) as http:
+            cur = url
+            for _ in range(6):
+                await assert_public(cur)
+                resp = await http.send(http.build_request("GET", cur), stream=True)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    cur = urljoin(cur, resp.headers.get("location", ""))
+                    await resp.aclose()
+                    continue
+                break
+            else:
+                raise ValueError("Too many redirects")
+            try:
+                if resp.status_code >= 400:
+                    raise ValueError(f"The source answered HTTP {resp.status_code}")
+                total = int(resp.headers.get("content-length") or 0)
+                if total > MAX_FILE_SIZE:
+                    raise ValueError("File is larger than the size limit")
+                fname = guess_name(resp, cur)
+                job.update(name=fname, total=total, stage="downloading")
+                sid = uuid.uuid4().hex[:10]
+                d = pick_tmp(total * 2) / f"zip_{sid}"
+                d.mkdir(parents=True, exist_ok=True)
+                path, t0 = d / "archive.bin", time.time()
+                async with aiofiles.open(path, "wb") as out:
+                    async for chunk in resp.aiter_bytes(1024 * 1024):
+                        job["done"] += len(chunk)
+                        if job["done"] > MAX_FILE_SIZE:
+                            raise ValueError("File is larger than the size limit")
+                        await out.write(chunk)
+                        job["speed"] = job["done"] / max(time.time() - t0, 0.1)
+            finally:
+                await resp.aclose()
+        job.update(stage="working", label="Opening archive", total=job["done"], speed=0)
+        await build_stage(sid, fname, d, path, job["done"], password)
+        d = None
+        job.update(stage="done", zip_id=sid, label=None)
+    except Exception as e:
+        log.error("Archive download failed: %s", e)
+        job.update(stage="error", error=str(e) or type(e).__name__)
+    finally:
+        _pending["n"] -= 1
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
 
 # ───────────────────────── App ─────────────────────────
 client = TelegramClient(MemorySession(), API_ID, API_HASH) if API_ID and API_HASH else None
@@ -1099,7 +1381,7 @@ DASH_BODY = r"""</style></head><body>
 <aside>
  <div class="brand">My Cloud</div>
  <button class="nv" id="n-files">Files</button><button class="nv" id="n-add">Add files</button>
- <button class="nv" id="n-zip">Zip files</button><button class="nv" id="n-subs">Subtitles</button><button class="nv" id="n-storage">Storage</button>
+ <button class="nv" id="n-zip">Archives</button><button class="nv" id="n-subs">Subtitles</button><button class="nv" id="n-storage">Storage</button>
  <div class="me"><span id="who"></span><form id="lo" method="post" action="/logout"><button>Sign out</button></form></div>
 </aside>
 <main>
@@ -1137,16 +1419,27 @@ DASH_BODY = r"""</style></head><body>
 </section>
 
 <section id="v-zip" hidden>
- <h1>Zip files</h1>
- <p class="lead">Upload a zip to look inside it first. Nothing is saved to your cloud until you choose what to do with it.</p>
+ <h1>Archives</h1>
+ <p class="lead">Upload a ZIP, RAR or 7z file, or give a link, to look inside it first. Nothing is saved to your cloud until you choose what to do with it.</p>
  <ol class="stp" id="zsteps" aria-label="Progress"><li aria-current="step">1 Upload</li><li>2 Review</li><li>3 Save</li></ol>
 
  <div id="zStart">
-  <div class="panel pad">
-   <label class="drop" id="zdrop" for="zpick"><b>Drop a .zip here or choose one</b><span>The server opens it and lists what is inside. Up to 20&nbsp;GB.</span></label>
-   <input type="file" id="zpick" accept=".zip,application/zip,application/x-zip-compressed" hidden>
+  <div class="two">
+   <div class="panel pad">
+    <h2>From this device</h2>
+    <label class="drop" id="zdrop" for="zpick"><b>Drop an archive here or choose one</b><span>.zip, .rar or .7z, up to 20&nbsp;GB. The server opens it and lists what is inside.</span></label>
+    <input type="file" id="zpick" accept=".zip,.rar,.7z,application/zip,application/x-zip-compressed,application/vnd.rar,application/x-7z-compressed" hidden>
+   </div>
+   <div class="panel pad">
+    <h2>From a link</h2>
+    <input type="text" id="zurl" placeholder="https://example.com/files.7z" aria-label="Archive link" autocomplete="off">
+    <p class="hint">The server downloads it directly, so nothing passes through your device. It needs a direct download link.</p>
+    <button class="btn" id="zfetch" type="button" style="margin-top:12px">Download and open</button>
+   </div>
+  </div>
+  <div class="panel pad" style="margin-top:16px">
+   <div class="grid"><div><label class="l" for="zpass" style="margin-top:0">Archive password (only if it has one)</label><input type="password" id="zpass" autocomplete="off"></div></div>
    <div id="zup" hidden><div class="rbar"><i></i></div><p class="hint"><span></span></p></div>
-   <div class="grid" style="margin-top:12px"><div><label class="l" for="zpass" style="margin-top:0">Zip password (only if it has one)</label><input type="password" id="zpass" autocomplete="off"></div></div>
    <p class="perr" id="zerr" role="alert"></p>
   </div>
   <div id="zwait"></div>
@@ -1156,7 +1449,7 @@ DASH_BODY = r"""</style></head><body>
   <div class="panel pad" style="margin-bottom:16px"><div class="zhead" id="zhead"></div></div>
 
   <div class="panel pad" id="zlockbox" hidden>
-   <h2>This zip is password protected</h2>
+   <h2>This archive is password protected</h2>
    <div class="zf"><input type="password" id="zlpass" placeholder="Password" autocomplete="off" aria-label="Zip password"><button class="btn" id="zunlock">Unlock</button></div>
    <p class="perr" id="zlmsg" role="alert"></p>
   </div>
@@ -1164,7 +1457,7 @@ DASH_BODY = r"""</style></head><body>
   <div id="zMain">
    <div class="panel" id="zFiles" data-mode="zip">
     <div class="zh">
-     <h2>Inside this zip</h2>
+     <h2>Inside this archive</h2>
      <div class="zf"><input type="text" id="zq" placeholder="Filter files" aria-label="Filter files">
       <div class="seg" id="zkind" style="margin:0"><button type="button" data-k="all" aria-pressed="true">All</button><button type="button" data-k="video" aria-pressed="false">Videos</button><button type="button" data-k="sub" aria-pressed="false">Subtitles</button><button type="button" data-k="other" aria-pressed="false">Other</button></div></div>
      <div class="zsel"><span>Tick what to use:</span><button class="btn ghost sm" id="zall" type="button">Select shown</button><button class="btn ghost sm" id="znone" type="button">Clear shown</button></div>
@@ -1173,7 +1466,7 @@ DASH_BODY = r"""</style></head><body>
    </div>
 
    <div class="modes" id="zmodes" role="group" aria-label="What to save">
-    <button type="button" class="mode" data-m="zip" aria-pressed="true"><b>Save as ZIP</b><span>Upload the zip file exactly as it is.</span></button>
+    <button type="button" class="mode" data-m="zip" aria-pressed="true"><b>Save the archive</b><span>Upload the ZIP, RAR or 7z file exactly as it is.</span></button>
     <button type="button" class="mode" data-m="extract" aria-pressed="false"><b>Save extracted files</b><span>Upload the files you tick, one by one.</span></button>
     <button type="button" class="mode" data-m="subs" aria-pressed="false"><b>Extract and add subtitles</b><span>Match videos with subtitle files and merge them as a selectable track.</span></button>
    </div>
@@ -1200,7 +1493,7 @@ DASH_BODY = r"""</style></head><body>
   <div class="panel" id="zRes" hidden>
    <div class="zh"><h2 id="zrt">Saving…</h2><div class="rbar" style="margin:0"><i id="zrbar"></i></div></div>
    <div id="zritems"></div>
-   <div class="pad rbtn" id="zrbtn" hidden><button class="btn" id="zfiles" type="button">View my files</button><button class="btn ghost" id="zback" type="button">Back to this zip</button><button class="btn ghost danger" id="zdone" type="button">Discard zip</button></div>
+   <div class="pad rbtn" id="zrbtn" hidden><button class="btn" id="zfiles" type="button">View my files</button><button class="btn ghost" id="zback" type="button">Back to this archive</button><button class="btn ghost danger" id="zdone" type="button">Discard archive</button></div>
   </div>
  </div>
 </section>
@@ -1408,24 +1701,35 @@ function zipUpload(file){if(!file)return;$('zerr').textContent='';
  const up=$('zup'),bar=up.querySelector('i'),st=up.querySelector('span'),r=new XMLHttpRequest(),t0=Date.now();up.hidden=false;bar.style.width='0';st.textContent='Uploading…';
  r.open('POST','/api/zip?name='+encodeURIComponent(file.name));
  if($('zpass').value)r.setRequestHeader('X-Zip-Password',encodeURIComponent($('zpass').value));
- r.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=e.loaded/e.total*100;bar.style.width=p+'%';st.textContent=p<100?Math.round(p)+'% · '+fmt(e.loaded/((Date.now()-t0)/1000||1))+'/s':'Opening the zip…'};
+ r.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=e.loaded/e.total*100;bar.style.width=p+'%';st.textContent=p<100?Math.round(p)+'% · '+fmt(e.loaded/((Date.now()-t0)/1000||1))+'/s':'Opening the archive…'};
  r.onload=()=>{up.hidden=true;let j={};try{j=JSON.parse(r.responseText)}catch(e){}if(r.status===401)return location.href='/login';if(r.status===200){$('zpass').value='';zipShow(j)}else $('zerr').textContent=j.detail||'Upload failed'};
  r.onerror=()=>{up.hidden=true;$('zerr').textContent='Network error'};r.send(file)}
+$('zfetch').onclick=async()=>{const url=$('zurl').value.trim();$('zerr').textContent='';if(!url)return toast('Paste a link first');
+ $('zfetch').disabled=true;const up=$('zup'),bar=up.querySelector('i'),st=up.querySelector('span'),done=()=>{up.hidden=true;$('zfetch').disabled=false};
+ up.hidden=false;bar.style.width='0';st.textContent='Starting…';
+ try{const r=await send('/api/zip/remote',{url,password:$('zpass').value}),j=await r.json();
+  if(!r.ok){done();$('zerr').textContent=j.detail||'Could not start';return}
+  const tick=async()=>{let q;try{q=await(await api('/api/jobs/'+j.id)).json()}catch(e){done();return}
+   if(q.stage==='downloading'){const p=q.total?q.done/q.total*100:null;bar.style.width=(p==null?35:p)+'%';st.textContent='Downloading '+(p==null?fmt(q.done):Math.round(p)+'% · '+fmt(q.speed)+'/s')}
+   else if(q.stage==='working'){bar.style.width='100%';st.textContent='Opening the archive…'}
+   else if(q.stage==='done'){done();$('zurl').value='';$('zpass').value='';const g=await api('/api/zip/'+q.zip_id),x=await g.json();if(g.ok)zipShow(x);else $('zerr').textContent=x.detail||'Could not open';return}
+   else if(q.stage==='error'){done();$('zerr').textContent=q.error||'Download failed';return}
+   setTimeout(tick,600)};tick()}catch(e){done()}};
 const zdrop=$('zdrop');['dragover','dragenter'].forEach(e=>zdrop.addEventListener(e,ev=>{ev.preventDefault();zdrop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>zdrop.addEventListener(e,ev=>{ev.preventDefault();zdrop.classList.remove('over')}));
 zdrop.addEventListener('drop',e=>zipUpload(e.dataTransfer.files[0]));$('zpick').onchange=e=>{zipUpload(e.target.files[0]);e.target.value=''};
 async function zipList(){try{const j=await(await api('/api/zips')).json(),L=j.zips||[];
- $('zwait').innerHTML=L.length?'<div class="panel" style="margin-top:16px"><div class="zh"><h2>Zips waiting for you</h2><p class="meta">Uploaded earlier and not saved to your cloud. They are deleted automatically.</p></div>'+L.map(z=>'<div class="it"><span class="ic"></span><div class="in"><b>'+esc(z.name)+'</b><small>'+fmt(z.size)+(z.locked?' · password needed':'')+' · removed in about '+Math.max(1,Math.round((z.expires-Date.now()/1000)/60))+' min'+(z.job?' · saving now':'')+'</small></div><span class="a"><button class="btn sm" data-o="'+esc(z.id)+'">Open</button>'+(z.job?'':'<button class="btn ghost sm danger" data-d="'+esc(z.id)+'">Discard</button>')+'</span></div>').join('')+'</div>':''}catch(e){}}
+ $('zwait').innerHTML=L.length?'<div class="panel" style="margin-top:16px"><div class="zh"><h2>Archives waiting for you</h2><p class="meta">Uploaded earlier and not saved to your cloud. They are deleted automatically.</p></div>'+L.map(z=>'<div class="it"><span class="ic"></span><div class="in"><b>'+esc(z.name)+'</b><small>'+fmt(z.size)+(z.locked?' · password needed':'')+' · removed in about '+Math.max(1,Math.round((z.expires-Date.now()/1000)/60))+' min'+(z.job?' · saving now':'')+'</small></div><span class="a"><button class="btn sm" data-o="'+esc(z.id)+'">Open</button>'+(z.job?'':'<button class="btn ghost sm danger" data-d="'+esc(z.id)+'">Discard</button>')+'</span></div>').join('')+'</div>':''}catch(e){}}
 $('zwait').onclick=async e=>{const b=e.target.closest('button');if(!b)return;
  if(b.dataset.o){const r=await api('/api/zip/'+b.dataset.o);const j=await r.json();if(r.ok)zipShow(j);else{toast(j.detail||'Not available');zipList()}}
- else if(b.dataset.d&&confirm('Discard this zip? The temporary copy is deleted.')){await api('/api/zip/'+b.dataset.d,{method:'DELETE'});zipList()}};
-$('zhead').onclick=async e=>{if(e.target.id!=='zdisc'||!ZS)return;if(!confirm('Discard this zip? The temporary copy is deleted and nothing is saved.'))return;
+ else if(b.dataset.d&&confirm('Discard this archive? The temporary copy is deleted.')){await api('/api/zip/'+b.dataset.d,{method:'DELETE'});zipList()}};
+$('zhead').onclick=async e=>{if(e.target.id!=='zdisc'||!ZS)return;if(!confirm('Discard this archive? The temporary copy is deleted and nothing is saved.'))return;
  const r=await api('/api/zip/'+ZS.id,{method:'DELETE'});if(r.ok)zipHome();else toast('Could not discard')};
 $('zunlock').onclick=async()=>{if(!ZS)return;$('zlmsg').textContent='';const r=await send('/api/zip/'+ZS.id+'/unlock',{password:$('zlpass').value}),j=await r.json();if(r.ok){$('zlpass').value='';zipShow(j)}else $('zlmsg').textContent=j.detail||'Could not unlock'};
 function zVisible(){const q=$('zq').value.toLowerCase();return(ZS.files||[]).filter(f=>(ZKIND==='all'||f.kind===ZKIND)&&f.path.toLowerCase().includes(q))}
 function renderZ(){if(!ZS)return;zView();
  const left=Math.max(1,Math.round((ZS.expires-Date.now()/1000)/60));
- $('zhead').innerHTML='<div><h2>'+esc(ZS.name)+'</h2><p class="meta">'+ZS.count+' files · '+fmt(ZS.size)+' zipped'+(ZS.total_size?' · '+fmt(ZS.total_size)+' unpacked':'')+' · temporary copy removed in about '+left+' min</p></div><div class="a"><span class="badge">Not saved yet</span><button class="btn ghost sm danger" id="zdisc" type="button">Discard zip</button></div>';
+ $('zhead').innerHTML='<div><h2>'+esc(ZS.name)+'</h2><p class="meta">'+ZS.count+' files · '+fmt(ZS.size)+' '+ZS.kind.toUpperCase()+(ZS.total_size?' · '+fmt(ZS.total_size)+' unpacked':'')+' · temporary copy removed in about '+left+' min</p></div><div class="a"><span class="badge">Not saved yet</span><button class="btn ghost sm danger" id="zdisc" type="button">Discard archive</button></div>';
  if(ZS.locked){$('zlmsg').textContent=ZS.lock_msg||'';return}
  const F=ZS.files,cnt={all:F.length,video:0,sub:0,other:0};F.forEach(f=>cnt[f.kind]++);
  document.querySelectorAll('#zkind button').forEach(b=>{b.textContent=zLabel[b.dataset.k]+' ('+cnt[b.dataset.k]+')';b.setAttribute('aria-pressed',b.dataset.k===ZKIND)});
@@ -1435,13 +1739,13 @@ function renderZ(){if(!ZS)return;zView();
  if(L.length>shown.length)$('zlist').innerHTML+='<div class="empty"><button class="btn ghost sm" id="zmore" type="button">Show all '+L.length+' files</button></div>';
  $('zFiles').dataset.mode=ZMODE;renderPairs();renderSum()}
 function renderPairs(){if(!ZS||ZMODE!=='subs')return;const S=ZS.files.filter(f=>f.kind==='sub'),V=ZS.files.filter(f=>f.kind==='video'&&ZSEL.has(f.i));
- if(!S.length){$('zpairs').innerHTML='<div class="empty">This zip has no subtitle files (.srt .ass .ssa .vtt).</div>';return}
+ if(!S.length){$('zpairs').innerHTML='<div class="empty">This archive has no subtitle files (.srt .ass .ssa .vtt).</div>';return}
  if(!V.length){$('zpairs').innerHTML='<div class="empty">Tick at least one video above.</div>';return}
  const opts=sel=>'<option value="">No subtitle</option>'+S.map(s=>'<option value="'+s.i+'"'+(sel===s.i?' selected':'')+'>'+esc(s.path)+'</option>').join('');
  $('zpairs').innerHTML=V.map(v=>{const has=ZPAIR[v.i]!=null,up=$('zunp').value==='upload',out=has?zMkv(v):(up?zTgt(v.path,'name'):null);
   return '<div class="pr"><div class="pv">'+esc(v.path)+'</div><select data-v="'+v.i+'" aria-label="Subtitle for '+esc(v.name)+'">'+opts(ZPAIR[v.i])+'</select><div class="po">'+(out?'Saved as '+esc(out)+(zEx(out)?' · replaces existing':''):'Left out (no subtitle chosen)')+'</div></div>'}).join('')}
 function renderSum(){if(!ZS||ZS.locked)return;const sel=ZS.files.filter(f=>ZSEL.has(f.i));let txt='',n=0,label='Upload';
- if(ZMODE==='zip'){txt=esc(ZS.name)+' · '+fmt(ZS.size);n=1;label='Upload ZIP'}
+ if(ZMODE==='zip'){txt=esc(ZS.name)+' · '+fmt(ZS.size);n=1;label='Upload archive'}
  else if(ZMODE==='extract'){n=sel.length;txt=n+' file'+(n===1?'':'s')+' · '+fmt(sel.reduce((a,f)=>a+f.size,0));label='Upload '+n+' file'+(n===1?'':'s')}
  else{const V=sel.filter(f=>f.kind==='video'),m=V.filter(v=>ZPAIR[v.i]!=null).length,u=V.length-m;n=m+($('zunp').value==='upload'?u:0);txt=m+' with subtitles'+(u?' · '+u+' without':'');label='Merge and upload '+n+' video'+(n===1?'':'s')}
  $('zsum').innerHTML=txt;$('zgo').textContent=label;$('zgo').disabled=n===0}
@@ -1807,10 +2111,10 @@ def _stage_or_404(sid: str) -> dict:
 
 @app.post("/api/zip")
 async def api_zip_upload(request: Request, name: str = ""):
-    """Receive a zip and list it. Nothing is saved to the datasets."""
+    """Receive a zip / rar / 7z and list it. Nothing is saved to the datasets."""
     require_login(request)
-    if len(STAGES) >= ZIP_MAX_STAGES:
-        raise HTTPException(429, f"{ZIP_MAX_STAGES} zips are already waiting. Discard one first.")
+    if len(STAGES) + _pending["n"] >= ZIP_MAX_STAGES:
+        raise HTTPException(429, f"{ZIP_MAX_STAGES} archives are already waiting. Discard one first.")
     try:
         fname = safe_name(name)
     except HTTPException:
@@ -1822,7 +2126,7 @@ async def api_zip_upload(request: Request, name: str = ""):
     sid = uuid.uuid4().hex[:10]
     d = pick_tmp(declared * 2) / f"zip_{sid}"
     d.mkdir(parents=True, exist_ok=True)
-    path, size = d / "archive.zip", 0
+    path, size = d / "archive.bin", 0
     try:
         async with aiofiles.open(path, "wb") as out:
             async for chunk in request.stream():
@@ -1832,22 +2136,31 @@ async def api_zip_upload(request: Request, name: str = ""):
                 await out.write(chunk)
         if size == 0:
             raise HTTPException(400, "Empty upload")
-        if not await asyncio.to_thread(zipfile.is_zipfile, path):
-            raise HTTPException(400, "That file is not a valid ZIP archive")
-        st = {"id": sid, "name": fname, "dir": d, "path": str(path), "size": size, "files": [], "locked": False,
-              "password": "", "seen": time.time(), "job": None}
-        try:
-            st["files"] = await asyncio.to_thread(_scan_zip, str(path), password)
-            st["password"] = password
-        except ZipLocked as e:
-            st["locked"], st["lock_msg"] = True, str(e)
-        except (ValueError, zipfile.BadZipFile) as e:
-            raise HTTPException(400, str(e) or "Could not read this zip")
-        STAGES[sid] = st
-        return stage_public(st)
+        return stage_public(await build_stage(sid, fname, d, path, size, password))
+    except ValueError as e:
+        shutil.rmtree(d, ignore_errors=True)
+        raise HTTPException(400, str(e) or "Could not read this archive")
     except BaseException:
         shutil.rmtree(d, ignore_errors=True)
         raise
+
+@app.post("/api/zip/remote")
+async def api_zip_remote(request: Request):
+    """The server downloads an archive from a link, then lists it."""
+    require_login(request)
+    if len(STAGES) + _pending["n"] >= ZIP_MAX_STAGES:
+        raise HTTPException(429, f"{ZIP_MAX_STAGES} archives are already waiting. Discard one first.")
+    b = await request.json()
+    url, password = str(b.get("url", "")).strip(), str(b.get("password") or "")
+    try:
+        await assert_public(url)
+    except Exception as e:
+        raise HTTPException(400, str(e) or "Invalid link")
+    job = new_job(url)
+    job["zip_id"] = None
+    _pending["n"] += 1
+    asyncio.create_task(run_zip_fetch(job, url, password))
+    return {"id": job["id"]}
 
 @app.get("/api/zips")
 def api_zips(request: Request):
@@ -1874,7 +2187,7 @@ async def api_zip_unlock(request: Request, sid: str):
     st = _stage_or_404(sid)
     password = str((await request.json()).get("password") or "")
     try:
-        st["files"] = await asyncio.to_thread(_scan_zip, st["path"], password)
+        st["files"] = await asyncio.to_thread(scan_archive, st["kind"], st["path"], password)
         st["password"], st["locked"], st["lock_msg"] = password, False, ""
     except ZipLocked as e:
         raise HTTPException(400, str(e))
@@ -1899,8 +2212,8 @@ async def api_zip_save(request: Request, sid: str):
     o = {"preferred": preferred}
     if mode == "zip":
         name = safe_name(str(b.get("name") or st["name"]).strip() or st["name"])
-        if not name.lower().endswith(".zip"):
-            name += ".zip"
+        if not name.lower().endswith("." + st["kind"]):
+            name += "." + st["kind"]
         plan, sizes = [{"target": name, "src": st["name"]}], [st["size"]]
     elif mode == "extract":
         try:
